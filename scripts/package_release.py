@@ -86,6 +86,11 @@ def package(version: str, output: Path) -> None:
                         payload["THIRD_PARTY_LICENSES/" + module["Path"] + "/" + license_name] = (
                             license_file.read_bytes())
             provenance["dependencies"] = dependencies
+            goroot = Path(subprocess.check_output(["go", "env", "GOROOT"], text=True).strip())
+            for license_name in ["LICENSE", "PATENTS"]:
+                license_file = goroot / license_name
+                if license_file.is_file():
+                    payload["THIRD_PARTY_LICENSES/Go/" + license_name] = license_file.read_bytes()
     else:
         for path, digest in manifest["files"].items():
             if hashlib.sha256(payload[path]).hexdigest() != digest:
