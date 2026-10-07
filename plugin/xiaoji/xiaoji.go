@@ -8,7 +8,6 @@ import (
 	"net/url"
 	"pansou/model"
 	"pansou/plugin"
-	"pansou/util"
 	"regexp"
 	"strings"
 	"sync"
@@ -21,31 +20,31 @@ import (
 var (
 	// 从详情页URL中提取ID的正则表达式
 	detailIDRegex = regexp.MustCompile(`/(\d+)\.html`)
-
+	
 	// go.html链接的正则表达式，用于提取base64编码部分
 	goLinkRegex = regexp.MustCompile(`/go\.html\?url=([A-Za-z0-9+/]+=*)`)
-
+	
 	// 年份提取正则表达式
 	yearRegex = regexp.MustCompile(`(\d{4})`)
-
+	
 	// 缓存相关
-	detailCache     = sync.Map{} // 缓存详情页解析结果
+	detailCache = sync.Map{} // 缓存详情页解析结果
 	lastCleanupTime = time.Now()
-	cacheTTL        = 1 * time.Hour
+	cacheTTL = 1 * time.Hour
 )
 
 const (
 	// 基础配置
 	pluginName = "xiaoji"
 	baseURL    = "https://www.xiaojitv.com"
-
+	
 	// 超时时间配置
 	DefaultTimeout = 10 * time.Second
 	DetailTimeout  = 8 * time.Second
-
+	
 	// 并发数配置
 	MaxConcurrency = 15
-
+	
 	// HTTP连接池配置
 	MaxIdleConns        = 100
 	MaxIdleConnsPerHost = 30
@@ -56,7 +55,7 @@ const (
 // 在init函数中注册插件
 func init() {
 	plugin.RegisterGlobalPlugin(NewXiaojiPlugin())
-
+	
 	// 启动缓存清理goroutine
 	go startCacheCleaner()
 }
@@ -65,7 +64,7 @@ func init() {
 func startCacheCleaner() {
 	ticker := time.NewTicker(30 * time.Minute)
 	defer ticker.Stop()
-
+	
 	for range ticker.C {
 		// 清空所有缓存
 		detailCache = sync.Map{}
@@ -82,7 +81,6 @@ type XiaojiAsyncPlugin struct {
 // createOptimizedHTTPClient 创建优化的HTTP客户端
 func createOptimizedHTTPClient() *http.Client {
 	transport := &http.Transport{
-		Proxy:               util.ProxyFuncForTransport(),
 		MaxIdleConns:        MaxIdleConns,
 		MaxIdleConnsPerHost: MaxIdleConnsPerHost,
 		MaxConnsPerHost:     MaxConnsPerHost,
@@ -96,7 +94,7 @@ func createOptimizedHTTPClient() *http.Client {
 // NewXiaojiPlugin 创建新的小鸡影视异步插件
 func NewXiaojiPlugin() *XiaojiAsyncPlugin {
 	return &XiaojiAsyncPlugin{
-		BaseAsyncPlugin: plugin.NewBaseAsyncPlugin(pluginName, 3),
+		BaseAsyncPlugin: plugin.NewBaseAsyncPlugin(pluginName, 3), 
 		optimizedClient: createOptimizedHTTPClient(),
 	}
 }
@@ -120,41 +118,41 @@ func (p *XiaojiAsyncPlugin) searchImpl(client *http.Client, keyword string, ext 
 	// 1. 构建搜索URL
 	encodedKeyword := url.QueryEscape(keyword)
 	searchURL := fmt.Sprintf("%s/?s=%s", baseURL, encodedKeyword)
-
+	
 	// 2. 创建带超时的上下文
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
 	defer cancel()
-
+	
 	// 3. 创建请求
 	req, err := http.NewRequestWithContext(ctx, "GET", searchURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("[%s] 创建请求失败: %w", pluginName, err)
 	}
-
+	
 	// 4. 设置请求头
 	p.setRequestHeaders(req)
-
+	
 	// 5. 发送请求
 	resp, err := p.doRequestWithRetry(req, client)
 	if err != nil {
 		return nil, fmt.Errorf("[%s] 搜索请求失败: %w", pluginName, err)
 	}
 	defer resp.Body.Close()
-
+	
 	// 6. 检查状态码
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("[%s] 请求返回状态码: %d", pluginName, resp.StatusCode)
 	}
-
+	
 	// 7. 解析HTML
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("[%s] HTML解析失败: %w", pluginName, err)
 	}
-
+	
 	// 8. 解析搜索结果
 	results := p.parseSearchResults(doc, keyword)
-
+	
 	// 9. 关键词过滤
 	return plugin.FilterResultsByKeyword(results, keyword), nil
 }
@@ -174,42 +172,35 @@ func (p *XiaojiAsyncPlugin) setRequestHeaders(req *http.Request) {
 func (p *XiaojiAsyncPlugin) doRequestWithRetry(req *http.Request, client *http.Client) (*http.Response, error) {
 	maxRetries := 3
 	var lastErr error
-
+	
 	for i := 0; i < maxRetries; i++ {
 		if i > 0 {
 			// 指数退避重试
 			backoff := time.Duration(1<<uint(i-1)) * 200 * time.Millisecond
 			time.Sleep(backoff)
 		}
-
+		
 		// 克隆请求避免并发问题
 		reqClone := req.Clone(req.Context())
-
+		
 		resp, err := client.Do(reqClone)
 		if err == nil && resp.StatusCode == 200 {
 			return resp, nil
 		}
-
+		
 		if resp != nil {
-			status := resp.StatusCode
 			resp.Body.Close()
-			if err == nil {
-				// Do 成功但状态码非 200。此前这里只执行 lastErr = err，
-				// err 为 nil 时会把 lastErr 清空，三次失败后仅报出
-				// "%!w(<nil>)"，真实状态码被丢掉、无法定位失败原因。
-				err = fmt.Errorf("HTTP 状态码 %d", status)
-			}
 		}
 		lastErr = err
 	}
-
+	
 	return nil, fmt.Errorf("重试 %d 次后仍然失败: %w", maxRetries, lastErr)
 }
 
 // parseSearchResults 解析搜索结果
 func (p *XiaojiAsyncPlugin) parseSearchResults(doc *goquery.Document, keyword string) []model.SearchResult {
 	results := make([]model.SearchResult, 0)
-
+	
 	// 查找所有搜索结果项
 	doc.Find("article.poster-item").Each(func(i int, s *goquery.Selection) {
 		result := p.parseSearchResultItem(s, keyword)
@@ -217,7 +208,7 @@ func (p *XiaojiAsyncPlugin) parseSearchResults(doc *goquery.Document, keyword st
 			results = append(results, *result)
 		}
 	})
-
+	
 	return results
 }
 
@@ -228,31 +219,31 @@ func (p *XiaojiAsyncPlugin) parseSearchResultItem(s *goquery.Selection, keyword 
 	if !exists || detailLink == "" {
 		return nil
 	}
-
+	
 	// 2. 确保链接是绝对路径
 	if strings.HasPrefix(detailLink, "/") {
 		detailLink = baseURL + detailLink
 	}
-
+	
 	// 3. 提取资源ID
 	matches := detailIDRegex.FindStringSubmatch(detailLink)
 	if len(matches) < 2 {
 		return nil
 	}
 	resourceID := matches[1]
-
+	
 	// 4. 提取标题
 	title := strings.TrimSpace(s.Find(".poster-title a").Text())
 	if title == "" {
 		return nil
 	}
-
+	
 	// 5. 提取评分
 	rating := strings.TrimSpace(s.Find(".rating-score").Text())
-
+	
 	// 6. 提取分类
 	category := strings.TrimSpace(s.Find(".poster-category a").Text())
-
+	
 	// 7. 提取标签
 	var tags []string
 	s.Find(".poster-tags a").Each(func(i int, tagSel *goquery.Selection) {
@@ -261,10 +252,10 @@ func (p *XiaojiAsyncPlugin) parseSearchResultItem(s *goquery.Selection, keyword 
 			tags = append(tags, tag)
 		}
 	})
-
+	
 	// 8. 提取封面图片
 	coverImg, _ := s.Find(".poster-image img").Attr("src")
-
+	
 	// 9. 构建基础信息
 	content := fmt.Sprintf("分类: %s", category)
 	if rating != "" {
@@ -273,26 +264,26 @@ func (p *XiaojiAsyncPlugin) parseSearchResultItem(s *goquery.Selection, keyword 
 	if len(tags) > 0 {
 		content += fmt.Sprintf(" | 标签: %s", strings.Join(tags, ", "))
 	}
-
+	
 	// 10. 获取详情页的下载链接
 	links := p.fetchDetailPageLinks(detailLink)
-
+	
 	// 11. 创建搜索结果
 	result := &model.SearchResult{
-		UniqueID: fmt.Sprintf("%s-%s", pluginName, resourceID),
-		Title:    title,
-		Content:  content,
-		Datetime: time.Now(),
-		Tags:     tags,
-		Links:    links,
-		Channel:  "", // 插件搜索结果必须为空字符串
+		UniqueID:  fmt.Sprintf("%s-%s", pluginName, resourceID),
+		Title:     title,
+		Content:   content,
+		Datetime:  time.Now(),
+		Tags:      tags,
+		Links:     links,
+		Channel:   "", // 插件搜索结果必须为空字符串
 	}
-
+	
 	// 12. 如果有封面图片，可以添加到额外信息中
 	if coverImg != "" {
 		// 这里可以扩展添加图片信息，当前版本暂不处理
 	}
-
+	
 	return result
 }
 
@@ -304,40 +295,40 @@ func (p *XiaojiAsyncPlugin) fetchDetailPageLinks(detailURL string) []model.Link 
 			return links
 		}
 	}
-
+	
 	// 2. 创建请求
 	ctx, cancel := context.WithTimeout(context.Background(), DetailTimeout)
 	defer cancel()
-
+	
 	req, err := http.NewRequestWithContext(ctx, "GET", detailURL, nil)
 	if err != nil {
 		return nil
 	}
-
+	
 	// 3. 设置请求头
 	p.setRequestHeaders(req)
-
+	
 	// 4. 发送请求
 	resp, err := p.doRequestWithRetry(req, p.optimizedClient)
 	if err != nil {
 		return nil
 	}
 	defer resp.Body.Close()
-
+	
 	// 5. 解析HTML
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
 	if err != nil {
 		return nil
 	}
-
+	
 	// 6. 提取下载链接
 	links := p.parseDetailPageLinks(doc)
-
+	
 	// 7. 缓存结果
 	if len(links) > 0 {
 		detailCache.Store(detailURL, links)
 	}
-
+	
 	return links
 }
 
@@ -345,16 +336,16 @@ func (p *XiaojiAsyncPlugin) fetchDetailPageLinks(detailURL string) []model.Link 
 func (p *XiaojiAsyncPlugin) parseDetailPageLinks(doc *goquery.Document) []model.Link {
 	links := make([]model.Link, 0)
 	seenLinks := make(map[string]bool) // 用于去重
-
+	
 	// 查找相关资源区域的链接
 	doc.Find(".resource-compact-link a").Each(func(i int, s *goquery.Selection) {
 		href, exists := s.Attr("href")
 		if !exists {
 			return
 		}
-
+		
 		var realURL string
-
+		
 		// 检查是否为go.html格式的链接（需要base64解码）
 		if strings.Contains(href, "/go.html?url=") {
 			// 提取并解码真实链接
@@ -363,24 +354,24 @@ func (p *XiaojiAsyncPlugin) parseDetailPageLinks(doc *goquery.Document) []model.
 			// 直接链接（包括磁力链接、网盘链接等）
 			realURL = href
 		}
-
+		
 		// 处理有效链接
 		if p.isValidURL(realURL) && !seenLinks[realURL] {
 			// 确定网盘类型
 			linkType := p.determineCloudType(realURL)
-
+			
 			// 创建链接对象
 			link := model.Link{
 				Type:     linkType,
 				URL:      realURL,
 				Password: "", // xiaoji网站通常无密码
 			}
-
+			
 			links = append(links, link)
 			seenLinks[realURL] = true
 		}
 	})
-
+	
 	return links
 }
 
@@ -391,15 +382,15 @@ func (p *XiaojiAsyncPlugin) decodeGoLink(goLink string) string {
 	if len(matches) < 2 {
 		return ""
 	}
-
+	
 	encoded := matches[1]
-
+	
 	// 2. 清理编码字符串
 	encoded = strings.TrimSpace(encoded)
 	if encoded == "" {
 		return ""
 	}
-
+	
 	// 3. Base64解码
 	decoded, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
@@ -417,14 +408,14 @@ func (p *XiaojiAsyncPlugin) decodeGoLink(goLink string) string {
 			return ""
 		}
 	}
-
+	
 	realURL := strings.TrimSpace(string(decoded))
-
+	
 	// 4. 验证解码结果是否为有效URL
 	if p.isValidURL(realURL) {
 		return realURL
 	}
-
+	
 	return ""
 }
 
@@ -433,7 +424,7 @@ func (p *XiaojiAsyncPlugin) isValidURL(urlStr string) bool {
 	if urlStr == "" {
 		return false
 	}
-
+	
 	// 检查基本的URL格式
 	if strings.HasPrefix(urlStr, "http://") || strings.HasPrefix(urlStr, "https://") {
 		// HTTP/HTTPS链接需要有域名
@@ -443,17 +434,17 @@ func (p *XiaojiAsyncPlugin) isValidURL(urlStr string) bool {
 		// 简单检查是否包含域名
 		return strings.Contains(urlStr[8:], ".")
 	}
-
+	
 	// 磁力链接
 	if strings.HasPrefix(urlStr, "magnet:") {
 		return len(urlStr) > 7 && strings.Contains(urlStr, "xt=")
 	}
-
+	
 	// ED2K链接
 	if strings.HasPrefix(urlStr, "ed2k://") {
 		return len(urlStr) > 7
 	}
-
+	
 	return false
 }
 

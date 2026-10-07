@@ -14,7 +14,6 @@ import (
 
 	"pansou/model"
 	"pansou/plugin"
-	"pansou/util"
 )
 
 const (
@@ -602,7 +601,6 @@ func newHTTPClient() *http.Client {
 	return &http.Client{
 		Timeout: requestTimeout,
 		Transport: &http.Transport{
-			Proxy:               util.ProxyFuncForTransport(),
 			MaxIdleConns:        httpMaxIdleConns,
 			MaxIdleConnsPerHost: httpMaxIdlePerHost,
 			MaxConnsPerHost:     httpMaxConnsPerHost,
@@ -621,32 +619,21 @@ func setHTMLHeaders(req *http.Request, referer string) {
 }
 
 func (p *YiovePlugin) doRequestWithRetry(req *http.Request, client *http.Client, maxRetries int) (*http.Response, error) {
-	var resp *http.Response
+	var lastErr error
 
-	// 重试逻辑收敛到 util.DoWithRetry：这段循环在多个插件里逐字复制过。
-	// 指数退避（retryBaseDelay × 2^attempt）与"最后一次不再等待"的语义保持不变。
-	err := util.DoWithRetry(util.RetryConfig{
-		Attempts:   maxRetries,
-		BaseDelay:  retryBaseDelay,
-		Multiplier: 2,
-	}, func(_ int) error {
-		r, err := client.Do(req.Clone(req.Context()))
-		if err != nil {
-			return err
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		resp, err := client.Do(req.Clone(req.Context()))
+		if err == nil && resp.StatusCode == http.StatusOK {
+			return resp, nil
 		}
-		if r.StatusCode == http.StatusOK {
-			resp = r
-			return nil
+		if resp != nil {
+			resp.Body.Close()
 		}
-		status := r.StatusCode
-		r.Body.Close()
-		// Do 成功但状态码非 200：必须把状态码带出来。此前这里只赋值 err，
-		// err 为 nil 时会把失败原因清空，几次失败后仅报出 "%!w(<nil>)"，
-		// 真实状态码被丢掉、无法定位。
-		return fmt.Errorf("HTTP 状态码 %d", status)
-	})
-	if err != nil {
-		return nil, err
+		lastErr = err
+		if attempt < maxRetries-1 {
+			time.Sleep(retryBaseDelay * time.Duration(1<<attempt))
+		}
 	}
-	return resp, nil
+
+	return nil, fmt.Errorf("重试 %d 次后失败: %w", maxRetries, lastErr)
 }

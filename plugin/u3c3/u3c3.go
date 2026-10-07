@@ -2,13 +2,12 @@ package u3c3
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
-	"pansou/util"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -17,11 +16,10 @@ import (
 )
 
 const (
-	BaseURL       = "https://u3c3.com"
-	legacyBaseURL = "https://u3c3u3c3.u3c3u3c3u3c3.com"
-	UserAgent     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-	MaxRetries    = 2
-	RetryDelay    = 500 * time.Millisecond
+	BaseURL    = "https://u3c3u3c3.u3c3u3c3u3c3.com"
+	UserAgent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+	MaxRetries = 3
+	RetryDelay = 2 * time.Second
 )
 
 // U3c3Plugin U3C3插件
@@ -30,49 +28,12 @@ type U3c3Plugin struct {
 	debugMode bool
 	search2   string // 缓存的search2参数
 	lastSync  time.Time
-	baseMu    sync.RWMutex
-	activeURL string
-}
-
-func (p *U3c3Plugin) baseCandidates() []string {
-	p.baseMu.RLock()
-	active := p.activeURL
-	p.baseMu.RUnlock()
-	result := make([]string, 0, 2)
-	seen := make(map[string]struct{}, 2)
-	for _, candidate := range []string{active, BaseURL, legacyBaseURL} {
-		if candidate == "" {
-			continue
-		}
-		if _, ok := seen[candidate]; ok {
-			continue
-		}
-		seen[candidate] = struct{}{}
-		result = append(result, candidate)
-	}
-	return result
-}
-
-func (p *U3c3Plugin) getActiveURL() string {
-	p.baseMu.RLock()
-	defer p.baseMu.RUnlock()
-	if p.activeURL == "" {
-		return BaseURL
-	}
-	return p.activeURL
-}
-
-func (p *U3c3Plugin) setActiveURL(baseURL string) {
-	p.baseMu.Lock()
-	p.activeURL = baseURL
-	p.baseMu.Unlock()
 }
 
 func init() {
 	p := &U3c3Plugin{
 		BaseAsyncPlugin: plugin.NewBaseAsyncPluginWithFilter("u3c3", 5, true),
 		debugMode:       false,
-		activeURL:       BaseURL,
 	}
 	plugin.RegisterGlobalPlugin(p)
 }
@@ -138,55 +99,53 @@ func (p *U3c3Plugin) getSearch2Parameter() (string, error) {
 	}
 
 	client := &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout: 30 * time.Second,
 	}
 
-	var search2 string
-	var lastErr error
-	for _, baseURL := range p.baseCandidates() {
-		req, err := http.NewRequest("GET", baseURL, nil)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		req.Header.Set("User-Agent", UserAgent)
-		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-		req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+	req, err := http.NewRequest("GET", BaseURL, nil)
+	if err != nil {
+		return "", err
+	}
 
-		var resp *http.Response
-		for i := 0; i < MaxRetries; i++ {
-			resp, lastErr = client.Do(req.Clone(req.Context()))
-			if lastErr == nil && resp.StatusCode == 200 {
-				break
-			}
-			if resp != nil {
-				resp.Body.Close()
-			}
-			if i < MaxRetries-1 {
-				time.Sleep(RetryDelay)
-			}
-		}
-		if lastErr != nil || resp == nil || resp.StatusCode != 200 {
-			continue
-		}
-		body, readErr := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
-		resp.Body.Close()
-		if readErr != nil {
-			lastErr = readErr
-			continue
-		}
-		search2 = p.extractSearch2FromHTML(string(body))
-		if search2 != "" {
-			p.setActiveURL(baseURL)
+	req.Header.Set("User-Agent", UserAgent)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+
+	var resp *http.Response
+	var lastErr error
+
+	// 重试机制
+	for i := 0; i < MaxRetries; i++ {
+		resp, lastErr = client.Do(req)
+		if lastErr == nil && resp.StatusCode == 200 {
 			break
 		}
-		lastErr = fmt.Errorf("无法从首页提取search2参数")
-	}
-	if search2 == "" {
-		if lastErr == nil {
-			lastErr = fmt.Errorf("u3c3 所有域名均不可用")
+		if resp != nil {
+			resp.Body.Close()
 		}
+		if i < MaxRetries-1 {
+			time.Sleep(RetryDelay)
+		}
+	}
+
+	if lastErr != nil {
 		return "", lastErr
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("HTTP状态码错误: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	// 从JavaScript中提取search2参数
+	search2 := p.extractSearch2FromHTML(string(body))
+	if search2 == "" {
+		return "", fmt.Errorf("无法从首页提取search2参数")
 	}
 
 	// 缓存参数
@@ -206,16 +165,16 @@ func (p *U3c3Plugin) extractSearch2FromHTML(html string) string {
 	lines := strings.Split(html, "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-
+		
 		// 跳过注释行
 		if strings.HasPrefix(line, "//") {
 			continue
 		}
-
+		
 		// 查找包含nmefafej的行
 		if strings.Contains(line, "nmefafej") && strings.Contains(line, `"`) {
 			// 使用正则提取引号内的值
-			re := u3c3Re1
+			re := regexp.MustCompile(`var\s+nmefafej\s*=\s*"([^"]+)"`)
 			matches := re.FindStringSubmatch(line)
 			if len(matches) > 1 && len(matches[1]) > 5 {
 				if p.debugMode {
@@ -223,7 +182,7 @@ func (p *U3c3Plugin) extractSearch2FromHTML(html string) string {
 				}
 				return matches[1]
 			}
-
+			
 			// 备用方案：直接提取引号内容
 			start := strings.Index(line, `"`)
 			if start != -1 {
@@ -251,15 +210,14 @@ func (p *U3c3Plugin) extractSearch2FromHTML(html string) string {
 func (p *U3c3Plugin) doSearch(keyword, search2 string) ([]model.SearchResult, error) {
 	// 构建搜索URL
 	encodedKeyword := url.QueryEscape(keyword)
-	baseURL := p.getActiveURL()
-	searchURL := fmt.Sprintf("%s/?search2=%s&search=%s", baseURL, search2, encodedKeyword)
+	searchURL := fmt.Sprintf("%s/?search2=%s&search=%s", BaseURL, search2, encodedKeyword)
 
 	if p.debugMode {
 		log.Printf("[U3C3] 搜索URL: %s", searchURL)
 	}
 
 	client := &http.Client{
-		Timeout: 15 * time.Second,
+		Timeout: 30 * time.Second,
 	}
 
 	req, err := http.NewRequest("GET", searchURL, nil)
@@ -268,7 +226,7 @@ func (p *U3c3Plugin) doSearch(keyword, search2 string) ([]model.SearchResult, er
 	}
 
 	req.Header.Set("User-Agent", UserAgent)
-	req.Header.Set("Referer", baseURL+"/")
+	req.Header.Set("Referer", BaseURL+"/")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
 
 	var resp *http.Response
@@ -297,7 +255,7 @@ func (p *U3c3Plugin) doSearch(keyword, search2 string) ([]model.SearchResult, er
 		return nil, fmt.Errorf("搜索请求失败，状态码: %d", resp.StatusCode)
 	}
 
-	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -336,7 +294,7 @@ func (p *U3c3Plugin) parseSearchResults(html string) ([]model.SearchResult, erro
 		// 提取详情页链接（可选，用于后续扩展）
 		detailURL, _ := titleLink.Attr("href")
 		if detailURL != "" && !strings.HasPrefix(detailURL, "http") {
-			detailURL = p.getActiveURL() + detailURL
+			detailURL = BaseURL + detailURL
 		}
 
 		// 提取链接信息
@@ -353,6 +311,7 @@ func (p *U3c3Plugin) parseSearchResults(html string) ([]model.SearchResult, erro
 				})
 			}
 		})
+
 
 		// 提取文件大小
 		sizeText := strings.TrimSpace(s.Find("td:nth-child(4)").Text())
@@ -403,9 +362,9 @@ func (p *U3c3Plugin) parseSearchResults(html string) ([]model.SearchResult, erro
 // cleanTitle 清理标题文本
 func (p *U3c3Plugin) cleanTitle(title string) string {
 	// 移除HTML标签
-	title = u3c3Re2.ReplaceAllString(title, "")
+	title = regexp.MustCompile(`<[^>]*>`).ReplaceAllString(title, "")
 	// 移除多余的空白字符
-	title = u3c3Re3.ReplaceAllString(title, " ")
+	title = regexp.MustCompile(`\s+`).ReplaceAllString(title, " ")
 	// 移除前后空白
 	title = strings.TrimSpace(title)
 	return title
@@ -448,11 +407,3 @@ func (p *U3c3Plugin) generateUniqueID(title, size string) string {
 	}
 	return fmt.Sprintf("u3c3-%d", hash)
 }
-
-// 以下正则原先在函数内临时编译，每次调用都要重新解析模式；
-// 提到包级后只编译一次，匹配行为不变。
-var (
-	u3c3Re1 = regexp.MustCompile(`var\s+nmefafej\s*=\s*"([^"]+)"`)
-	u3c3Re2 = regexp.MustCompile(`<[^>]*>`)
-	u3c3Re3 = regexp.MustCompile(`\s+`)
-)

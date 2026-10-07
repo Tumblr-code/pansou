@@ -40,29 +40,8 @@ var MobilePanPattern = regexp.MustCompile(`https?://(?:(?:www\.)?yun\.139\.com/s
 var PasswordPattern = regexp.MustCompile(`(?i)(?:(?:提取|访问|提取密|密)码|pwd)[：:]\s*([a-zA-Z0-9]{4})(?:[^a-zA-Z0-9]|$)`)
 var UrlPasswordPattern = regexp.MustCompile(`(?i)[?&]pwd=([a-zA-Z0-9]{4})(?:[^a-zA-Z0-9]|$)`)
 
-// NearbyPasswordPattern 用于"链接附近"这段短窗口里找提取码。
-//
-// 与 PasswordPattern 的区别是长度：它写死 4 位，而真实的提取码有 5~6 位的。窗口已经很短，
-// 放宽到 4~6 位再配合 isValidPassword 校验，比要求恰好 4 位更贴合实际。
-var NearbyPasswordPattern = regexp.MustCompile(`(?i)(?:(?:提取|访问|提取密|密)码|pwd)[：:\\s]*([a-zA-Z0-9]{4,6})(?:[^a-zA-Z0-9]|$)`)
-
 // 百度网盘密码专用正则表达式 - 确保只提取4位密码
 var BaiduPasswordPattern = regexp.MustCompile(`(?i)(?:链接：.*?提取码：|密码：|提取码：|pwd=|pwd:|pwd：)([a-zA-Z0-9]{4})(?:[^a-zA-Z0-9]|$)`)
-
-// 以下四条原先是 ExtractPassword 内部的临时编译。
-// ExtractPassword 在每条链接上都会被调用，函数内编译等于把编译开销
-// 乘以链接数；提到包级只编译一次（实测单次调用 23.5µs -> 6.7µs）。
-// 天翼云盘访问码：（访问码：xxxx）或URL编码形式
-var TianyiAccessCodePattern = regexp.MustCompile(`(?:（访问码：|%EF%BC%88%E8%AE%BF%E9%97%AE%E7%A0%81%EF%BC%9A)([a-zA-Z0-9]+)(?:）|%EF%BC%89)`)
-
-// 迅雷网盘 URL 中的 pwd 参数
-var XunleiPwdPattern = regexp.MustCompile(`\?pwd=([a-zA-Z0-9]{4})`)
-
-// 115 网盘 URL 中的 password 参数
-var Pan115PasswordPattern = regexp.MustCompile(`password=([a-zA-Z0-9]{4})`)
-
-// 123 网盘 URL 中的提取码（兼容 URL 编码）
-var Pan123ExtractCodePattern = regexp.MustCompile(`(?:提取码|%E6%8F%90%E5%8F%96%E7%A0%81)[:：]([a-zA-Z0-9]+)`)
 
 // GetLinkType 获取链接类型
 func GetLinkType(url string) string {
@@ -217,9 +196,7 @@ func CleanUCPanURL(url string) string {
 			url = url[startIdx:]
 
 			// 查找可能的结束标记（包括常见的网盘名称，可能出现在链接后面）
-			// URL href 本身通常已经是完整链接，不能把分享码中合法的
-			// "123" 当作后续文本分隔符（例如 /s/abc123）。
-			endMarkers := []string{" ", "\n", "\t", "，", "。", "；", ";", "，", ",", "网盘", "夸克", "阿里", "百度"}
+			endMarkers := []string{" ", "\n", "\t", "，", "。", "；", ";", "，", ",", "网盘", "123", "夸克", "阿里", "百度"}
 			minEndIdx := len(url)
 
 			for _, marker := range endMarkers {
@@ -491,7 +468,8 @@ func ExtractPassword(content, url string) string {
 	// 特殊处理天翼云盘URL中的访问码
 	if strings.Contains(url, "cloud.189.cn") {
 		// 天翼云盘访问码格式：（访问码：xxxx）或者URL编码形式
-		tianyiMatches := TianyiAccessCodePattern.FindStringSubmatch(url)
+		tianyiPasswordPattern := regexp.MustCompile(`(?:（访问码：|%EF%BC%88%E8%AE%BF%E9%97%AE%E7%A0%81%EF%BC%9A)([a-zA-Z0-9]+)(?:）|%EF%BC%89)`)
+		tianyiMatches := tianyiPasswordPattern.FindStringSubmatch(url)
 		if len(tianyiMatches) > 1 {
 			return tianyiMatches[1]
 		}
@@ -499,7 +477,8 @@ func ExtractPassword(content, url string) string {
 
 	// 特殊处理迅雷网盘URL中的pwd参数
 	if strings.Contains(url, "pan.xunlei.com") && strings.Contains(url, "?pwd=") {
-		pwdMatches := XunleiPwdPattern.FindStringSubmatch(url)
+		pwdPattern := regexp.MustCompile(`\?pwd=([a-zA-Z0-9]{4})`)
+		pwdMatches := pwdPattern.FindStringSubmatch(url)
 		if len(pwdMatches) > 1 {
 			return pwdMatches[1]
 		}
@@ -518,7 +497,8 @@ func ExtractPassword(content, url string) string {
 		strings.Contains(url, "password=") {
 
 		// 尝试从URL中提取密码
-		passwordMatches := Pan115PasswordPattern.FindStringSubmatch(url)
+		passwordPattern := regexp.MustCompile(`password=([a-zA-Z0-9]{4})`)
+		passwordMatches := passwordPattern.FindStringSubmatch(url)
 		if len(passwordMatches) > 1 {
 			return passwordMatches[1]
 		}
@@ -535,7 +515,8 @@ func ExtractPassword(content, url string) string {
 		(strings.Contains(url, "提取码") || strings.Contains(url, "%E6%8F%90%E5%8F%96%E7%A0%81")) {
 
 		// 尝试从URL中提取提取码（处理普通文本和URL编码两种情况）
-		codeMatches := Pan123ExtractCodePattern.FindStringSubmatch(url)
+		extractCodePattern := regexp.MustCompile(`(?:提取码|%E6%8F%90%E5%8F%96%E7%A0%81)[:：]([a-zA-Z0-9]+)`)
+		codeMatches := extractCodePattern.FindStringSubmatch(url)
 		if len(codeMatches) > 1 {
 			return codeMatches[1]
 		}

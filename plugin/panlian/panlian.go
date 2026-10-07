@@ -11,17 +11,15 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"html"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"os"
-	"pansou/util"
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,23 +31,16 @@ import (
 	"pansou/util/json"
 )
 
-// DefaultBaseURL 是站点根地址。声明为变量而非常量，是为了让测试能指向本地假服务器，
-// 从而验证重试与中止语义，而不是只能靠肉眼看代码。
-var DefaultBaseURL = "https://pinglian.lol"
-
 const (
 	PluginName        = "panlian"
 	DisplayName       = "盘链"
 	Description       = "盘链 - 登录后检索影视资源并聚合网盘链接"
+	DefaultBaseURL    = "https://pinglian.lol"
 	ConfigFileName    = "panlian_config.json"
 	RequestTimeout    = 20 * time.Second
 	MaxConcurrentJobs = 4
 	MaxVideoResults   = 10
 	MaxLinksPerResult = 200
-	// The new site protects link URLs behind a short-lived unlock ticket and
-	// limits the number of unlocks per account/day. Keep enough links for each
-	// title while avoiding a single search exhausting the account quota.
-	MaxResolvedLinksPerVideo = 3
 )
 
 var (
@@ -58,29 +49,21 @@ var (
 	errLoginRequired = errors.New("login required")
 
 	panOrder = map[string]int{
-		"quark":   0,
-		"uc":      1,
-		"baidu":   2,
-		"xunlei":  3,
-		"123":     4,
-		"tianyi":  5,
-		"115":     6,
-		"aliyun":  7,
-		"guangya": 8,
-		"mobile":  9,
-		"pikpak":  10,
-		"magnet":  11,
-		"others":  12,
+		"quark":  0,
+		"uc":     1,
+		"baidu":  2,
+		"xunlei": 3,
+		"123":    4,
+		"tianyi": 5,
+		"115":    6,
+		"aliyun": 7,
+		"mobile": 8,
+		"magnet": 9,
+		"others": 10,
 	}
 
 	extractCodeNoiseRegex = regexp.MustCompile(`(?i)([?？]?\s*(提取码|访问码|密码)[:：]\s*[a-z0-9]{4,8})+$`)
 	htmlTagRegex          = regexp.MustCompile(`<[^>]+>`)
-	pan123ShareHostRegex  = regexp.MustCompile(`(?i)(^|\.)share\.(?:123684\.com|123865\.com|123912\.com|123pan\.com|123pan\.cn|123592\.com)$`)
-	panTokenURLRegexes    = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)id=["']jumpBtn["'][^>]*href=["']([^"']+)["']`),
-		regexp.MustCompile(`(?i)href=["']([^"']+)["'][^>]*id=["']jumpBtn["']`),
-		regexp.MustCompile(`(?i)(?:targetUrl|window\.location\.href|location\.href)\s*=\s*["']([^"']+)["']`),
-	}
 )
 
 const htmlTemplate = `<!DOCTYPE html>
@@ -234,19 +217,6 @@ const htmlTemplate = `<!DOCTYPE html>
     @keyframes spin {
       to { transform: rotate(360deg); }
     }
-    .captcha-row {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-    }
-
-    .captcha-row img {
-      height: 38px;
-      border-radius: 6px;
-      border: 1px solid rgba(148, 163, 184, 0.35);
-      cursor: pointer;
-      background: #fff;
-    }
   </style>
 </head>
 <body>
@@ -276,21 +246,9 @@ const htmlTemplate = `<!DOCTYPE html>
           <label for="password">密码</label>
           <input id="password" type="password" autocomplete="current-password">
         </div>
-        <div>
-          <label for="captcha">图形验证码</label>
-          <div class="captcha-row">
-            <input id="captcha" autocomplete="off" placeholder="输入图中字符">
-            <img id="captchaImg" alt="点击刷新验证码" title="点击刷新验证码" onclick="refreshCaptcha()">
-          </div>
-        </div>
-        <div id="emailRow" class="hidden">
-          <label for="loginEmail">账号绑定的邮箱</label>
-          <input id="loginEmail" autocomplete="email" placeholder="用于站点确认本人操作">
-        </div>
       </div>
       <div class="actions">
         <button type="button" onclick="login()">登录并保存</button>
-        <button type="button" onclick="confirmEmail()">确认邮箱并完成登录</button>
       </div>
     </div>
 
@@ -378,85 +336,14 @@ const htmlTemplate = `<!DOCTYPE html>
       }
     }
 
-    let captchaId = "";
-    let confirmId = "";
-
-    async function refreshCaptcha() {
-      try {
-        const result = await postAction("captcha", {});
-        if (result.success && result.data) {
-          captchaId = result.data.captcha_id || "";
-          document.getElementById("captcha").value = "";
-          document.getElementById("captchaImg").src = result.data.image || "";
-        } else {
-          showResult(result);
-        }
-      } catch (error) {
-        showError(error);
-      }
-    }
-
     async function login() {
       try {
         const username = document.getElementById("username").value.trim();
         const password = document.getElementById("password").value;
-        const captchaCode = document.getElementById("captcha").value.trim();
-        if (!captchaId) {
-          await refreshCaptcha();
-          showError("验证码已刷新，请按图中字符填写");
-          return;
-        }
-        const result = await postAction("login", {
-          username, password, remember: true, captcha_id: captchaId, captcha_code: captchaCode
-        });
-        showResult(result);
-        if (result.success && result.data && result.data.need_email) {
-          confirmId = result.data.confirm_id || "";
-          const row = document.getElementById("emailRow");
-          row.classList.remove("hidden");
-          const hint = result.data.email_hint;
-          if (hint) {
-            document.getElementById("loginEmail").placeholder = "账号邮箱（站点提示 " + hint + "）";
-          }
-          return;
-        }
-        if (result.success) {
-          document.getElementById("password").value = "";
-          document.getElementById("emailRow").classList.add("hidden");
-          await refreshCaptcha();
-          await loadStatus();
-          return;
-        }
-        if (result.data && result.data.captcha_required) {
-          await refreshCaptcha();
-        }
-      } catch (error) {
-        showError(error);
-      }
-    }
-
-    async function confirmEmail() {
-      try {
-        const username = document.getElementById("username").value.trim();
-        const password = document.getElementById("password").value;
-        const email = document.getElementById("loginEmail").value.trim();
-        if (!confirmId) {
-          showError("请先完成上一步登录（账号、密码、图形验证码）");
-          return;
-        }
-        if (!email) {
-          showError("请输入该账号绑定的邮箱");
-          return;
-        }
-        const result = await postAction("confirm_email", {
-          username, password, remember: true, confirm_id: confirmId, email
-        });
+        const result = await postAction("login", { username, password, remember: true });
         showResult(result);
         if (result.success) {
-          confirmId = "";
           document.getElementById("password").value = "";
-          document.getElementById("emailRow").classList.add("hidden");
-          await refreshCaptcha();
           await loadStatus();
         }
       } catch (error) {
@@ -499,10 +386,7 @@ const htmlTemplate = `<!DOCTYPE html>
       }
     }
 
-    window.onload = async () => {
-      await loadStatus();
-      await refreshCaptcha();
-    };
+    window.onload = loadStatus;
   </script>
 </body>
 </html>`
@@ -533,19 +417,9 @@ type User struct {
 }
 
 type LoginResponse struct {
-	Success   bool      `json:"success"`
-	Message   string    `json:"message"`
-	ErrorType string    `json:"error_type"`
-	Data      LoginUser `json:"data"`
-	// Details 承载站点新增的校验信息：图形验证码是否错误、是否需要邮箱二次确认。
-	// 站点自 2026 年起登录必须过图形验证码，且还要输入一次账号绑定的邮箱。
-	Details struct {
-		CaptchaError        bool   `json:"captcha_error"`
-		ConfirmID           string `json:"confirm_id"`
-		Email               string `json:"email"`
-		EmailVerifyRequired bool   `json:"email_verify_required"`
-	} `json:"details"`
-	User struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+	User    struct {
 		ID         int    `json:"id"`
 		Username   string `json:"username"`
 		Email      string `json:"email"`
@@ -554,52 +428,7 @@ type LoginResponse struct {
 	} `json:"user"`
 }
 
-type LoginUser struct {
-	ID                 int    `json:"user_id"`
-	Role               string `json:"role"`
-	Username           string `json:"username"`
-	IsAdmin            bool   `json:"is_admin"`
-	MustChangePassword bool   `json:"must_change_password"`
-	FilesAllowed       bool   `json:"files_allowed"`
-	MountAllowed       bool   `json:"mount_allowed"`
-}
-
-// CaptchaResponse 对应站点 GET /api/auth/captcha：返回验证码 id 与 base64 图片。
-// 该接口不需要 Cookie（id 本身就是后续登录的参数），所以插件侧无需保存会话状态。
-type CaptchaResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
-	Data    struct {
-		ID    string `json:"id"`
-		Image string `json:"image"`
-	} `json:"data"`
-}
-
-// 站点每次登录都要图形验证码，机器人无法自行识别，必须由用户在界面上填写。
-var (
-	errCaptchaRequired = errors.New("站点要求图形验证码")
-	errCaptchaInvalid  = errors.New("图形验证码错误")
-)
-
-// loginAttempt 描述一次登录尝试：要么直接成功（带回 Cookie），
-// 要么停在"请输入账号绑定的邮箱"这一步（带回 confirm_id 与站点给的掩码邮箱提示）。
-type loginAttempt struct {
-	NeedEmail bool
-	ConfirmID string
-	EmailHint string
-	Cookie    string
-	Username  string
-}
-
 type VideoSearchResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
-	Data    struct {
-		List     []VideoItem `json:"list"`
-		Page     int         `json:"page"`
-		PageSize int         `json:"page_size"`
-		Total    int         `json:"total"`
-	} `json:"data"`
 	Code      int         `json:"code"`
 	Msg       string      `json:"msg"`
 	Page      int         `json:"page"`
@@ -609,25 +438,6 @@ type VideoSearchResponse struct {
 }
 
 type VideoItem struct {
-	ID      int    `json:"id"`
-	Title   string `json:"title"`
-	Alias   string `json:"alias"`
-	Cover   string `json:"cover"`
-	Intro   string `json:"intro"`
-	Year    string `json:"year"`
-	Area    string `json:"area"`
-	Lang    string `json:"lang"`
-	Remarks string `json:"remarks"`
-	Score   string `json:"score"`
-	// 注意：这里必须是 "type" 而不是 "type_name"。
-	// 同层出现两个相同的 json tag 时，encoding/json 与本项目实际使用的 sonic
-	// （pansou/util/json）行为一致：**两个字段全部忽略且不报错**（实测确认，
-	// 见 panlian_jsontag_test.go）。于是接口返回的 type_name 谁也没接住，
-	// 下面 normalize 里的 firstNonEmpty(TypeName, Type) 也就永远落空。
-	Type        string `json:"type"`
-	Actor       string `json:"actor"`
-	DirectorNew string `json:"director"`
-
 	VodID       int    `json:"vod_id"`
 	VodName     string `json:"vod_name"`
 	VodPic      string `json:"vod_pic"`
@@ -640,49 +450,6 @@ type VideoItem struct {
 	VodActor    string `json:"vod_actor"`
 	VodDirector string `json:"vod_director"`
 	VodContent  string `json:"vod_content"`
-}
-
-type VideoDetailResponse struct {
-	Success bool            `json:"success"`
-	Message string          `json:"message"`
-	Data    VideoDetailData `json:"data"`
-}
-
-type VideoDetailData struct {
-	Video VideoItem   `json:"video"`
-	Links []VideoLink `json:"links"`
-}
-
-type VideoLink struct {
-	ID         int    `json:"id"`
-	Title      string `json:"title"`
-	PanType    string `json:"pan_type"`
-	IsMagnet   bool   `json:"is_magnet"`
-	Note       string `json:"note"`
-	HasCode    bool   `json:"has_code"`
-	Username   string `json:"username"`
-	CreatedAt  string `json:"created_at"`
-	UpdatedAt  string `json:"updated_at"`
-	VideoTitle string `json:"video_title"`
-}
-
-type LinkTicketResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
-	Data    struct {
-		Code      string `json:"code"`
-		ExpiresIn int    `json:"expires_in"`
-		Ticket    string `json:"ticket"`
-	} `json:"data"`
-}
-
-type LinkOpenResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
-	Data    struct {
-		Code string `json:"code"`
-		URL  string `json:"url"`
-	} `json:"data"`
 }
 
 type PanLinkResponse struct {
@@ -701,19 +468,10 @@ type PanGroup struct {
 type PanLinkItem struct {
 	Title    string `json:"title"`
 	URL      string `json:"url"`
-	Token    string `json:"token"`
 	Password string `json:"password"`
 	Type     string `json:"type"`
 	Time     string `json:"time"`
 	Source   string `json:"source"`
-	ID       string `json:"id"`
-	UserTier string `json:"user_tier"`
-}
-
-type resolveTokenResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
-	URL     string `json:"url"`
 }
 
 var (
@@ -809,7 +567,7 @@ func (p *PanlianPlugin) searchWithUser(client *http.Client, user *User, keyword 
 	results, err := p.searchOnce(client, user, keyword)
 	if err == nil {
 		user.LastAccessAt = time.Now()
-		p.saveUserOrLog(user)
+		_ = p.saveUser(user)
 		return results, nil
 	}
 
@@ -819,7 +577,7 @@ func (p *PanlianPlugin) searchWithUser(client *http.Client, user *User, keyword 
 	if user.EncryptedPassword == "" || user.Username == "" {
 		user.Status = "expired"
 		user.Cookie = ""
-		p.saveUserOrLog(user)
+		_ = p.saveUser(user)
 		return nil, err
 	}
 
@@ -1035,34 +793,6 @@ func (p *PanlianPlugin) flattenPanLinks(groups map[string]PanGroup) ([]model.Lin
 }
 
 func (p *PanlianPlugin) fetchVideos(client *http.Client, cookie string, keyword string) (*VideoSearchResponse, error) {
-	// Since 2026 the site exposes a Vue/JSON API under /api/videos. Keep the
-	// legacy endpoint below as a compatibility fallback for older deployments.
-	newValues := url.Values{}
-	newValues.Set("search", keyword)
-	newValues.Set("sort", "year_desc")
-	newValues.Set("page", "1")
-	newValues.Set("page_size", strconv.Itoa(MaxVideoResults))
-
-	var modern VideoSearchResponse
-	if err := p.doJSONGET(client, cookie, "/api/videos", newValues, &modern); err == nil && isModernVideoSearchResponse(modern) {
-		if !modern.Success {
-			if isLoginMessage(modern.Message) {
-				return nil, fmt.Errorf("%w: %s", errLoginRequired, modern.Message)
-			}
-			return nil, fmt.Errorf("盘链影片接口异常: %s", modern.Message)
-		}
-		modern.List = make([]VideoItem, 0, len(modern.Data.List))
-		for _, item := range modern.Data.List {
-			modern.List = append(modern.List, normalizeVideoItem(item))
-		}
-		modern.Total = modern.Data.Total
-		modern.Page = modern.Data.Page
-		modern.PageCount = 0
-		return &modern, nil
-	} else if errors.Is(err, errLoginRequired) {
-		return nil, err
-	}
-
 	values := url.Values{}
 	values.Set("wd", keyword)
 	values.Set("pg", "1")
@@ -1081,23 +811,6 @@ func (p *PanlianPlugin) fetchVideos(client *http.Client, cookie string, keyword 
 }
 
 func (p *PanlianPlugin) fetchPanLinks(client *http.Client, cookie string, keyword string, vodID int) (*PanLinkResponse, error) {
-	var detail VideoDetailResponse
-	if err := p.doJSONGET(client, cookie, "/api/videos/"+strconv.Itoa(vodID), nil, &detail); err == nil && isModernVideoDetailResponse(detail) {
-		if !detail.Success {
-			if isLoginMessage(detail.Message) {
-				return nil, fmt.Errorf("%w: %s", errLoginRequired, detail.Message)
-			}
-			return nil, fmt.Errorf("盘链影片详情接口异常: %s", detail.Message)
-		}
-		groups, err := p.resolveModernLinks(client, cookie, detail.Data.Links)
-		if err != nil {
-			return nil, err
-		}
-		return &PanLinkResponse{Success: true, Total: len(detail.Data.Links), Data: groups}, nil
-	} else if errors.Is(err, errLoginRequired) {
-		return nil, err
-	}
-
 	values := url.Values{}
 	values.Set("keyword", keyword)
 	values.Set("vod_id", fmt.Sprintf("%d", vodID))
@@ -1113,286 +826,7 @@ func (p *PanlianPlugin) fetchPanLinks(client *http.Client, cookie string, keywor
 	if !resp.Success {
 		return nil, fmt.Errorf("盘链网盘接口异常: %s", resp.Message)
 	}
-	p.resolvePanLinkTokens(client, cookie, resp.Data)
 	return &resp, nil
-}
-
-func isModernVideoSearchResponse(resp VideoSearchResponse) bool {
-	return resp.Success || resp.Message != "" || resp.Data.List != nil || resp.Data.Total > 0
-}
-
-func isModernVideoDetailResponse(resp VideoDetailResponse) bool {
-	return resp.Success && (resp.Data.Video.ID > 0 || resp.Data.Links != nil)
-}
-
-// resolveModernLinks converts the current flat link model into the grouped
-// model used by PanSou. The upstream only reveals URLs after a short-lived
-// ticket is issued, so resolve a small, representative set per title to stay
-// within the account's daily quota.
-func (p *PanlianPlugin) resolveModernLinks(client *http.Client, cookie string, links []VideoLink) (map[string]PanGroup, error) {
-	if len(links) == 0 {
-		return map[string]PanGroup{}, nil
-	}
-	selected := selectModernLinks(links, MaxResolvedLinksPerVideo)
-	groups := make(map[string]PanGroup)
-	for _, link := range selected {
-		resolvedURL, password, err := p.resolveModernLink(client, cookie, link.ID)
-		if err != nil {
-			if errors.Is(err, errLoginRequired) {
-				return nil, err
-			}
-			continue
-		}
-		linkType := normalizeLinkType(link.PanType, resolvedURL)
-		if link.IsMagnet {
-			linkType = "magnet"
-		}
-		if linkType == "" {
-			linkType = "others"
-		}
-		group := groups[linkType]
-		group.Name = linkType
-		group.Links = append(group.Links, PanLinkItem{
-			Title:    strings.TrimSpace(link.Title),
-			URL:      resolvedURL,
-			Password: firstNonEmpty(password, ""),
-			Type:     linkType,
-			Time:     firstNonEmpty(link.UpdatedAt, link.CreatedAt),
-			Source:   link.Username,
-			ID:       strconv.Itoa(link.ID),
-		})
-		groups[linkType] = group
-	}
-	return groups, nil
-}
-
-func selectModernLinks(links []VideoLink, limit int) []VideoLink {
-	if limit <= 0 || len(links) <= limit {
-		return links
-	}
-	selected := make([]VideoLink, 0, limit)
-	seenTypes := make(map[string]struct{})
-	for _, link := range links {
-		linkType := normalizePanTypeName(link.PanType)
-		if linkType == "" {
-			linkType = normalizeLinkType(link.PanType, "")
-		}
-		if _, ok := seenTypes[linkType]; ok {
-			continue
-		}
-		seenTypes[linkType] = struct{}{}
-		selected = append(selected, link)
-		if len(selected) >= limit {
-			return selected
-		}
-	}
-	for _, link := range links {
-		if len(selected) >= limit {
-			break
-		}
-		found := false
-		for _, current := range selected {
-			if current.ID == link.ID {
-				found = true
-				break
-			}
-		}
-		if !found {
-			selected = append(selected, link)
-		}
-	}
-	return selected
-}
-
-func (p *PanlianPlugin) resolveModernLink(client *http.Client, cookie string, linkID int) (string, string, error) {
-	if linkID <= 0 {
-		return "", "", fmt.Errorf("盘链链接 ID 无效")
-	}
-	values := map[string]interface{}{"link_id": linkID}
-	payload, err := json.Marshal(values)
-	if err != nil {
-		return "", "", err
-	}
-	var ticket LinkTicketResponse
-	if err := p.doJSONPOST(client, cookie, "/api/videos/link-ticket", payload, &ticket); err != nil {
-		return "", "", err
-	}
-	if !ticket.Success {
-		if isLoginMessage(ticket.Message) {
-			return "", "", fmt.Errorf("%w: %s", errLoginRequired, ticket.Message)
-		}
-		return "", "", fmt.Errorf("盘链链接票据接口异常: %s", ticket.Message)
-	}
-	if strings.TrimSpace(ticket.Data.Ticket) == "" {
-		return "", "", fmt.Errorf("盘链链接票据为空")
-	}
-
-	query := url.Values{}
-	query.Set("t", ticket.Data.Ticket)
-	var opened LinkOpenResponse
-	if err := p.doJSONGET(client, cookie, "/api/videos/link-open/"+strconv.Itoa(linkID), query, &opened); err != nil {
-		return "", "", err
-	}
-	if !opened.Success {
-		if isLoginMessage(opened.Message) {
-			return "", "", fmt.Errorf("%w: %s", errLoginRequired, opened.Message)
-		}
-		return "", "", fmt.Errorf("盘链链接解锁接口异常: %s", opened.Message)
-	}
-	resolvedURL := strings.TrimSpace(opened.Data.URL)
-	if !isRealPanURL(resolvedURL) {
-		return "", "", fmt.Errorf("盘链链接解锁后未返回有效地址")
-	}
-	return resolvedURL, strings.TrimSpace(opened.Data.Code), nil
-}
-
-func (p *PanlianPlugin) resolvePanLinkTokens(client *http.Client, cookie string, groups map[string]PanGroup) {
-	type tokenJob struct {
-		groupKey string
-		index    int
-		token    string
-	}
-	type tokenResult struct {
-		groupKey string
-		index    int
-		url      string
-	}
-
-	jobs := make([]tokenJob, 0)
-	for groupKey, group := range groups {
-		for index, item := range group.Links {
-			candidate := strings.TrimSpace(item.URL)
-			if !isRealPanURL(candidate) {
-				candidate = strings.TrimSpace(item.Token)
-			}
-			if candidate != "" && !isRealPanURL(candidate) {
-				jobs = append(jobs, tokenJob{groupKey: groupKey, index: index, token: candidate})
-			}
-		}
-	}
-	if len(jobs) == 0 {
-		return
-	}
-
-	resultCh := make(chan tokenResult, len(jobs))
-	sem := make(chan struct{}, MaxConcurrentJobs)
-	var wg sync.WaitGroup
-	for _, job := range jobs {
-		job := job
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			resolvedURL, err := p.resolvePanToken(client, cookie, job.token)
-			if err == nil && isRealPanURL(resolvedURL) {
-				resultCh <- tokenResult{groupKey: job.groupKey, index: job.index, url: resolvedURL}
-			}
-		}()
-	}
-	wg.Wait()
-	close(resultCh)
-
-	for result := range resultCh {
-		group, ok := groups[result.groupKey]
-		if !ok || result.index < 0 || result.index >= len(group.Links) {
-			continue
-		}
-		group.Links[result.index].URL = result.url
-		groups[result.groupKey] = group
-	}
-}
-
-func (p *PanlianPlugin) resolvePanToken(client *http.Client, cookie string, token string) (string, error) {
-	token = strings.TrimSpace(token)
-	if token == "" {
-		return "", fmt.Errorf("盘链 token 为空")
-	}
-	if isRealPanURL(token) {
-		return token, nil
-	}
-	if client == nil {
-		client = p.GetClient()
-	}
-	if client == nil {
-		client = &http.Client{Timeout: RequestTimeout}
-	}
-
-	payload, err := json.Marshal(map[string]string{"token": token})
-	if err != nil {
-		return "", err
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, DefaultBaseURL+"/api/resolve_token.php", bytes.NewReader(payload))
-	if err == nil {
-		p.setPanlianHeaders(req, cookie, DefaultBaseURL+"/pages/video.php")
-		req.Header.Set("Content-Type", "application/json")
-		resp, doErr := client.Do(req)
-		if doErr == nil {
-			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-			resp.Body.Close()
-			if readErr == nil && resp.StatusCode == http.StatusOK {
-				var resolved resolveTokenResponse
-				if json.Unmarshal(body, &resolved) == nil && resolved.Success && isRealPanURL(resolved.URL) {
-					cancel()
-					return strings.TrimSpace(resolved.URL), nil
-				}
-			}
-		}
-	}
-	cancel()
-
-	goURL := DefaultBaseURL + "/api/go.php?t=" + url.QueryEscape(token)
-	ctx, cancel = context.WithTimeout(context.Background(), RequestTimeout)
-	defer cancel()
-	req, err = http.NewRequestWithContext(ctx, http.MethodGet, goURL, nil)
-	if err != nil {
-		return "", err
-	}
-	p.setPanlianHeaders(req, cookie, DefaultBaseURL+"/pages/video.php")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-
-	redirectClient := *client
-	redirectClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
-	resp, err := redirectClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if location := strings.TrimSpace(resp.Header.Get("Location")); isRealPanURL(location) {
-		return decodePanURL(location), nil
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return "", err
-	}
-	for _, pattern := range panTokenURLRegexes {
-		match := pattern.FindSubmatch(body)
-		if len(match) > 1 {
-			resolvedURL := decodePanURL(string(match[1]))
-			if isRealPanURL(resolvedURL) {
-				return resolvedURL, nil
-			}
-		}
-	}
-	return "", fmt.Errorf("盘链 token 未解析出真实链接")
-}
-
-func decodePanURL(value string) string {
-	value = html.UnescapeString(strings.TrimSpace(value))
-	return strings.ReplaceAll(value, `\/`, `/`)
-}
-
-func (p *PanlianPlugin) setPanlianHeaders(req *http.Request, cookie string, referer string) {
-	req.Header.Set("User-Agent", browserUserAgent())
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("Accept-Language", "zh-TW,zh;q=0.9,zh-CN;q=0.8,en;q=0.7")
-	req.Header.Set("Origin", DefaultBaseURL)
-	req.Header.Set("Referer", referer)
-	if cookie != "" {
-		req.Header.Set("Cookie", cookie)
-	}
 }
 
 func (p *PanlianPlugin) doJSONGET(client *http.Client, cookie string, path string, values url.Values, out interface{}) error {
@@ -1405,25 +839,14 @@ func (p *PanlianPlugin) doJSONGET(client *http.Client, cookie string, path strin
 		targetURL += "?" + values.Encode()
 	}
 
-	var ok bool
-
-	// 重试逻辑收敛到 util.DoWithRetry。这处有两类"重试没有意义"的错误，用 util.Abort 中止：
-	// 登录失效（cookie 过期，再试还是失效）与响应格式不对（再试还是不对）。
-	// 退避是**线性**的（(attempt+1) × 200ms），用 DelayFunc 原样表达。
-	err := util.DoWithRetry(util.RetryConfig{
-		Attempts: 3,
-		DelayFunc: func(attempt int) time.Duration {
-			return time.Duration(attempt+1) * 200 * time.Millisecond
-		},
-	}, func(_ int) error {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
-		defer cancel()
-
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 		if err != nil {
-			return util.Abort(err) // 建请求就失败，重试没意义
+			cancel()
+			return err
 		}
-
 		req.Header.Set("User-Agent", browserUserAgent())
 		req.Header.Set("X-Requested-With", "XMLHttpRequest")
 		req.Header.Set("Accept", "application/json, text/plain, */*")
@@ -1436,263 +859,143 @@ func (p *PanlianPlugin) doJSONGET(client *http.Client, cookie string, path strin
 
 		resp, err := client.Do(req)
 		if err != nil {
-			return err
+			cancel()
+			lastErr = err
+			time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+			continue
 		}
-		body, readErr := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
+
+		body, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		cancel()
 		if readErr != nil {
-			return readErr
+			lastErr = readErr
+			time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+			continue
 		}
 		if resp.StatusCode != http.StatusOK {
-			if resp.StatusCode == http.StatusUnauthorized || bytes.Contains(bytes.ToLower(body), []byte("请先登录")) || bytes.Contains(bytes.ToLower(body), []byte("admin_auth_required")) {
-				return util.Abort(fmt.Errorf("%w: HTTP %d", errLoginRequired, resp.StatusCode))
-			}
-			return fmt.Errorf("HTTP %d", resp.StatusCode)
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+			continue
 		}
 		if err := json.Unmarshal(body, out); err != nil {
 			if bytes.Contains(body, []byte("请先登录")) || bytes.Contains(body, []byte("login")) {
-				return util.Abort(fmt.Errorf("%w: %s", errLoginRequired, string(body)))
+				return fmt.Errorf("%w: %s", errLoginRequired, string(body))
 			}
-			return util.Abort(fmt.Errorf("解析接口响应失败: %w", err))
+			return fmt.Errorf("解析接口响应失败: %w", err)
 		}
-		ok = true
 		return nil
-	})
-	if err != nil {
-		return err
 	}
-	if !ok {
-		return fmt.Errorf("请求未成功")
-	}
-	return nil
+
+	return lastErr
 }
 
-func (p *PanlianPlugin) doJSONPOST(client *http.Client, cookie string, path string, payload []byte, out interface{}) error {
-	if client == nil {
-		client = &http.Client{Timeout: RequestTimeout}
-	}
-	targetURL := DefaultBaseURL + path
-	ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(payload))
-	if err != nil {
-		return err
-	}
-	p.setPanlianHeaders(req, cookie, DefaultBaseURL+"/videos")
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode != http.StatusOK {
-		if resp.StatusCode == http.StatusUnauthorized || bytes.Contains(bytes.ToLower(body), []byte("请先登录")) || bytes.Contains(bytes.ToLower(body), []byte("admin_auth_required")) {
-			return fmt.Errorf("%w: HTTP %d", errLoginRequired, resp.StatusCode)
-		}
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	if err := json.Unmarshal(body, out); err != nil {
-		return fmt.Errorf("解析接口响应失败: %w", err)
-	}
-	return nil
-}
-
-func (p *PanlianPlugin) doLogin(username string, password string, remember bool, captchaID string, captchaCode string) (*loginAttempt, error) {
-	username = strings.TrimSpace(username)
-	if username == "" || password == "" {
-		return nil, fmt.Errorf("账号和密码不能为空")
-	}
-	if strings.TrimSpace(captchaID) == "" || strings.TrimSpace(captchaCode) == "" {
-		return nil, errCaptchaRequired
-	}
+func (p *PanlianPlugin) doLogin(username string, password string, remember bool) (string, *LoginResponse, error) {
 	jar, _ := cookiejar.New(nil)
 	client := &http.Client{
 		Timeout: RequestTimeout,
 		Jar:     jar,
 	}
 
-	form := url.Values{}
-	form.Set("username", username)
-	form.Set("password", password)
-	if remember {
-		form.Set("remember", "1")
-	}
-	form.Set("captcha_id", strings.TrimSpace(captchaID))
-	form.Set("captcha_code", strings.TrimSpace(captchaCode))
-
+	loginPageURL := DefaultBaseURL + "/pages/login.php"
 	ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, DefaultBaseURL+"/api/auth/login", strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, loginPageURL, nil)
 	if err != nil {
 		cancel()
-		return nil, err
+		return "", nil, err
 	}
-	p.setPanlianHeaders(req, "", DefaultBaseURL+"/login")
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-
+	req.Header.Set("User-Agent", browserUserAgent())
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "zh-TW,zh;q=0.9,zh-CN;q=0.8,en;q=0.7")
 	resp, err := client.Do(req)
 	if err != nil {
 		cancel()
-		return nil, err
+		return "", nil, err
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	cancel()
+	if resp.StatusCode != http.StatusOK {
+		return "", nil, fmt.Errorf("获取登录页失败: HTTP %d", resp.StatusCode)
+	}
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	_ = writer.WriteField("username", strings.TrimSpace(username))
+	_ = writer.WriteField("password", password)
+	if remember {
+		_ = writer.WriteField("remember", "on")
+	}
+	if err := writer.Close(); err != nil {
+		return "", nil, err
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), RequestTimeout)
+	req, err = http.NewRequestWithContext(ctx, http.MethodPost, DefaultBaseURL+"/api/login.php", &body)
+	if err != nil {
+		cancel()
+		return "", nil, err
+	}
+	req.Header.Set("User-Agent", browserUserAgent())
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "zh-TW,zh;q=0.9,zh-CN;q=0.8,en;q=0.7")
+	req.Header.Set("Origin", DefaultBaseURL)
+	req.Header.Set("Referer", loginPageURL)
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	resp, err = client.Do(req)
+	if err != nil {
+		cancel()
+		return "", nil, err
 	}
 	defer resp.Body.Close()
 
-	respBody, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
+	respBody, err := io.ReadAll(resp.Body)
 	cancel()
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusBadRequest {
-		// 站点用 400 + JSON 表达"验证码错/需要邮箱确认"，所以 400 不是异常。
-		return nil, fmt.Errorf("登录请求失败: HTTP %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		return "", nil, fmt.Errorf("登录请求失败: HTTP %d", resp.StatusCode)
 	}
 
 	var loginResp LoginResponse
 	if err := json.Unmarshal(respBody, &loginResp); err != nil {
-		return nil, fmt.Errorf("解析登录响应失败: %w", err)
+		return "", nil, fmt.Errorf("解析登录响应失败: %w", err)
 	}
-
 	if !loginResp.Success {
-		if loginResp.Details.CaptchaError || strings.Contains(loginResp.Message, "验证码") {
-			return nil, errCaptchaInvalid
-		}
-		if loginResp.Details.EmailVerifyRequired && loginResp.Details.ConfirmID != "" {
-			return &loginAttempt{
-				NeedEmail: true,
-				ConfirmID: loginResp.Details.ConfirmID,
-				EmailHint: loginResp.Details.Email,
-			}, nil
-		}
-		message := strings.TrimSpace(loginResp.Message)
-		if message == "" {
-			message = "登录失败"
-		}
-		return nil, errors.New(message)
+		return "", nil, errors.New(strings.TrimSpace(loginResp.Message))
 	}
 
 	baseURL, _ := url.Parse(DefaultBaseURL)
 	cookieString := cookiesToString(jar.Cookies(baseURL))
 	if cookieString == "" {
-		return nil, fmt.Errorf("登录成功但未获取到有效 Cookie")
+		return "", nil, fmt.Errorf("登录成功但未获取到有效 Cookie")
 	}
 
-	return &loginAttempt{
-		Cookie:   cookieString,
-		Username: firstNonEmpty(loginResp.Data.Username, loginResp.User.Username, username),
-	}, nil
-}
-
-// fetchCaptcha 取一张新的图形验证码，返回 (id, base64 图片 data URL)。
-func (p *PanlianPlugin) fetchCaptcha() (string, string, error) {
-	client := &http.Client{Timeout: RequestTimeout}
-	ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, DefaultBaseURL+"/api/auth/captcha", nil)
-	if err != nil {
-		return "", "", err
-	}
-	p.setPanlianHeaders(req, "", DefaultBaseURL+"/login")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", "", err
-	}
-	defer resp.Body.Close()
-
-	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
-	if err != nil {
-		return "", "", err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("获取验证码失败: HTTP %d", resp.StatusCode)
-	}
-	var cr CaptchaResponse
-	if err := json.Unmarshal(body, &cr); err != nil {
-		return "", "", fmt.Errorf("解析验证码响应失败: %w", err)
-	}
-	if !cr.Success || cr.Data.ID == "" || cr.Data.Image == "" {
-		return "", "", errors.New(firstNonEmpty(cr.Message, "站点未返回验证码"))
-	}
-	return cr.Data.ID, cr.Data.Image, nil
-}
-
-// confirmEmailLogin 完成登录第二步：提交 confirm_id 与账号绑定的邮箱。
-// 站点校对通过后直接下发 admin_session Cookie，整个登录即完成（不需要收邮箱里的验证码）。
-func (p *PanlianPlugin) confirmEmailLogin(confirmID string, email string, remember bool) (string, string, error) {
-	confirmID = strings.TrimSpace(confirmID)
-	email = strings.TrimSpace(email)
-	if confirmID == "" || email == "" {
-		return "", "", fmt.Errorf("缺少确认标识或邮箱")
-	}
-	jar, _ := cookiejar.New(nil)
-	client := &http.Client{
-		Timeout: RequestTimeout,
-		Jar:     jar,
-	}
-
-	form := url.Values{}
-	form.Set("confirm_id", confirmID)
-	form.Set("email", email)
-	if remember {
-		form.Set("remember", "1")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, DefaultBaseURL+"/api/auth/login/confirm-email", strings.NewReader(form.Encode()))
-	if err != nil {
-		cancel()
-		return "", "", err
-	}
-	p.setPanlianHeaders(req, "", DefaultBaseURL+"/login")
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		cancel()
-		return "", "", err
-	}
-	defer resp.Body.Close()
-
-	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
-	cancel()
-	if err != nil {
-		return "", "", err
-	}
-	var cr LoginResponse
-	if err := json.Unmarshal(body, &cr); err != nil {
-		return "", "", fmt.Errorf("解析邮箱确认响应失败: %w", err)
-	}
-	if !cr.Success {
-		message := strings.TrimSpace(cr.Message)
-		if message == "" {
-			message = "邮箱确认失败"
-		}
-		return "", "", errors.New(message)
-	}
-
-	baseURL, _ := url.Parse(DefaultBaseURL)
-	cookieString := cookiesToString(jar.Cookies(baseURL))
-	if cookieString == "" {
-		return "", "", fmt.Errorf("邮箱确认通过但未获取到有效 Cookie")
-	}
-	return cookieString, firstNonEmpty(cr.Data.Username, cr.User.Username), nil
+	return cookieString, &loginResp, nil
 }
 
 func (p *PanlianPlugin) reloginUser(user *User) error {
-	// 站点自 2026 年起每次登录都要求图形验证码（还要输一次账号绑定的邮箱），机器人无法自动通过，
-	// 所以"用保存的密码自动续期"这条路已经断了。这里把用户标记为过期，
-	// 交由用户在盘链管理页重新登录（会话 Cookie 有效期 30 天，正常使用不会频繁触发）。
-	user.Status = "expired"
-	user.Cookie = ""
-	p.saveUserOrLog(user)
-	return fmt.Errorf("站点登录已改为图形验证码 + 邮箱确认，无法自动续期，请在盘链管理里重新登录")
+	password, err := p.decryptPassword(user.EncryptedPassword)
+	if err != nil {
+		return err
+	}
+	cookie, _, err := p.doLogin(user.Username, password, true)
+	if err != nil {
+		user.Status = "expired"
+		user.Cookie = ""
+		_ = p.saveUser(user)
+		return err
+	}
+
+	user.Cookie = cookie
+	user.Status = "active"
+	user.LoginAt = time.Now()
+	user.ExpireAt = time.Now().Add(30 * 24 * time.Hour)
+	user.LastAccessAt = time.Now()
+	return p.saveUser(user)
 }
 
 func (p *PanlianPlugin) handleManagePage(c *gin.Context) {
@@ -1725,10 +1028,6 @@ func (p *PanlianPlugin) handleManagePagePOST(c *gin.Context) {
 		p.handleGetStatus(c, hash)
 	case "login":
 		p.handleLogin(c, hash, reqData)
-	case "captcha":
-		p.handleCaptcha(c)
-	case "confirm_email":
-		p.handleConfirmEmail(c, hash, reqData)
 	case "logout":
 		p.handleLogout(c, hash)
 	case "update_config":
@@ -1749,10 +1048,10 @@ func (p *PanlianPlugin) handleGetStatus(c *gin.Context, hash string) {
 			CreatedAt:    time.Now(),
 			LastAccessAt: time.Now(),
 		}
-		p.saveUserOrLog(user)
+		_ = p.saveUser(user)
 	} else {
 		user.LastAccessAt = time.Now()
-		p.saveUserOrLog(user)
+		_ = p.saveUser(user)
 	}
 
 	loggedIn := user.Status == "active" && user.Cookie != ""
@@ -1780,41 +1079,17 @@ func (p *PanlianPlugin) handleLogin(c *gin.Context, hash string, reqData map[str
 	username, _ := reqData["username"].(string)
 	password, _ := reqData["password"].(string)
 	remember, _ := reqData["remember"].(bool)
-	captchaID, _ := reqData["captcha_id"].(string)
-	captchaCode, _ := reqData["captcha_code"].(string)
 	if strings.TrimSpace(username) == "" || password == "" {
 		respondError(c, "缺少用户名或密码")
 		return
 	}
 
-	attempt, err := p.doLogin(username, password, remember || !reqDataHasKey(reqData, "remember"), captchaID, captchaCode)
+	cookie, loginResp, err := p.doLogin(username, password, remember || !reqDataHasKey(reqData, "remember"))
 	if err != nil {
-		switch {
-		case errors.Is(err, errCaptchaRequired):
-			respondErrorData(c, "请先输入图形验证码", gin.H{"captcha_required": true})
-		case errors.Is(err, errCaptchaInvalid):
-			respondErrorData(c, "图形验证码错误或已过期，已为你换一张，请重新输入", gin.H{"captcha_required": true, "captcha_invalid": true})
-		default:
-			respondError(c, "登录失败: "+err.Error())
-		}
+		respondError(c, "登录失败: "+err.Error())
 		return
 	}
 
-	if attempt.NeedEmail {
-		// 停在第二步：让用户在界面上输入该账号绑定的邮箱。
-		respondSuccess(c, "为了确认是本人操作，请输入该账号绑定的邮箱", gin.H{
-			"need_email": true,
-			"confirm_id": attempt.ConfirmID,
-			"email_hint": attempt.EmailHint,
-		})
-		return
-	}
-
-	p.finishLogin(c, hash, strings.TrimSpace(username), password, attempt.Cookie, attempt.Username)
-}
-
-// finishLogin 把登录成功的结果落盘：加密保存密码与 Cookie，供后续搜索复用。
-func (p *PanlianPlugin) finishLogin(c *gin.Context, hash, username, password, cookie, loginUsername string) {
 	encryptedPassword, err := p.encryptPassword(password)
 	if err != nil {
 		respondError(c, "密码加密失败: "+err.Error())
@@ -1828,7 +1103,7 @@ func (p *PanlianPlugin) finishLogin(c *gin.Context, hash, username, password, co
 			CreatedAt: time.Now(),
 		}
 	}
-	user.Username = username
+	user.Username = strings.TrimSpace(username)
 	user.EncryptedPassword = encryptedPassword
 	user.Cookie = cookie
 	user.Status = "active"
@@ -1842,47 +1117,9 @@ func (p *PanlianPlugin) finishLogin(c *gin.Context, hash, username, password, co
 	}
 
 	respondSuccess(c, "登录成功", gin.H{
-		"username": firstNonEmpty(loginUsername, username),
+		"username": loginResp.User.Username,
 		"status":   "active",
 	})
-}
-
-// handleCaptcha 取一张图形验证码交给前端显示；验证码由用户肉眼识别后回填。
-func (p *PanlianPlugin) handleCaptcha(c *gin.Context) {
-	id, image, err := p.fetchCaptcha()
-	if err != nil {
-		respondError(c, "获取验证码失败: "+err.Error())
-		return
-	}
-	respondSuccess(c, "", gin.H{
-		"captcha_id": id,
-		"image":      image,
-	})
-}
-
-// handleConfirmEmail 完成登录第二步：校验账号绑定的邮箱并落地会话。
-func (p *PanlianPlugin) handleConfirmEmail(c *gin.Context, hash string, reqData map[string]interface{}) {
-	confirmID, _ := reqData["confirm_id"].(string)
-	email, _ := reqData["email"].(string)
-	username, _ := reqData["username"].(string)
-	password, _ := reqData["password"].(string)
-	remember, _ := reqData["remember"].(bool)
-	if strings.TrimSpace(confirmID) == "" || strings.TrimSpace(email) == "" {
-		respondError(c, "缺少邮箱或确认标识，请重新登录")
-		return
-	}
-	if strings.TrimSpace(username) == "" || password == "" {
-		respondError(c, "缺少用户名或密码，请重新登录")
-		return
-	}
-
-	cookie, loginUsername, err := p.confirmEmailLogin(confirmID, email, remember || !reqDataHasKey(reqData, "remember"))
-	if err != nil {
-		respondErrorData(c, "邮箱确认失败: "+err.Error(), gin.H{"need_email": true, "confirm_id": confirmID})
-		return
-	}
-
-	p.finishLogin(c, hash, strings.TrimSpace(username), password, cookie, loginUsername)
 }
 
 func (p *PanlianPlugin) handleLogout(c *gin.Context, hash string) {
@@ -2117,7 +1354,7 @@ func normalizePanLinks(groupKey string, group PanGroup) []PanLinkItem {
 	for _, link := range group.Links {
 		linkType := normalizeLinkType(firstNonEmpty(link.Type, groupKey), link.URL)
 		linkURL := normalizePanURL(link.URL, link.Password, linkType)
-		if !isRealPanURL(linkURL) {
+		if linkURL == "" {
 			continue
 		}
 
@@ -2130,13 +1367,10 @@ func normalizePanLinks(groupKey string, group PanGroup) []PanLinkItem {
 		items = append(items, PanLinkItem{
 			Title:    strings.TrimSpace(link.Title),
 			URL:      linkURL,
-			Token:    strings.TrimSpace(link.Token),
 			Password: strings.TrimSpace(link.Password),
 			Type:     linkType,
 			Time:     strings.TrimSpace(link.Time),
 			Source:   strings.TrimSpace(link.Source),
-			ID:       strings.TrimSpace(link.ID),
-			UserTier: strings.TrimSpace(link.UserTier),
 		})
 	}
 
@@ -2144,29 +1378,6 @@ func normalizePanLinks(groupKey string, group PanGroup) []PanLinkItem {
 		return parseLinkTime(items[i].Time).After(parseLinkTime(items[j].Time))
 	})
 	return items
-}
-
-func normalizeVideoItem(item VideoItem) VideoItem {
-	if item.VodID == 0 {
-		item.VodID = item.ID
-	}
-	item.VodName = firstNonEmpty(item.VodName, item.Title)
-	item.VodPic = firstNonEmpty(item.VodPic, item.Cover)
-	item.VodRemarks = firstNonEmpty(item.VodRemarks, item.Remarks)
-	item.VodScore = firstNonEmpty(item.VodScore, item.Score)
-	item.VodYear = firstNonEmpty(item.VodYear, item.Year)
-	item.VodArea = firstNonEmpty(item.VodArea, item.Area)
-	item.VodLang = firstNonEmpty(item.VodLang, item.Lang)
-	item.TypeName = firstNonEmpty(item.TypeName, item.Type)
-	item.VodActor = firstNonEmpty(item.VodActor, item.Actor)
-	item.VodDirector = firstNonEmpty(item.VodDirector, item.DirectorNew)
-	item.VodContent = firstNonEmpty(item.VodContent, item.Intro)
-	return item
-}
-
-func isLoginMessage(message string) bool {
-	text := strings.ToLower(strings.TrimSpace(message))
-	return strings.Contains(text, "登录") || strings.Contains(text, "login") || strings.Contains(text, "auth_required")
 }
 
 func normalizePanTypeName(value string) string {
@@ -2182,20 +1393,16 @@ func normalizePanTypeName(value string) string {
 		return "quark"
 	case "uc", "uc网盘":
 		return "uc"
-	case "123", "123网盘", "123pan", "a123":
+	case "123", "123网盘":
 		return "123"
-	case "天翼", "天翼云盘", "a189":
+	case "天翼", "天翼云盘":
 		return "tianyi"
-	case "115", "115网盘", "a115":
+	case "115", "115网盘":
 		return "115"
-	case "阿里", "阿里云盘", "aliyun", "阿里云", "ali":
+	case "阿里", "阿里云盘", "aliyun":
 		return "aliyun"
-	case "光鸭", "光鸭网盘", "guangya", "guangyapan", "gy":
-		return "guangya"
-	case "中国移动云盘", "移动云盘", "mobile", "a139":
+	case "中国移动云盘", "移动云盘":
 		return "mobile"
-	case "pikpak", "pikpak网盘":
-		return "pikpak"
 	case "磁力", "磁链":
 		return "magnet"
 	default:
@@ -2227,7 +1434,7 @@ func normalizeLinkType(rawType string, rawURL string) string {
 		return "ed2k"
 	case strings.Contains(urlLower, "pan.quark.cn"), strings.Contains(urlLower, "pan.qoark.cn"):
 		return "quark"
-	case strings.Contains(urlLower, "drive.uc.cn"), strings.Contains(urlLower, "pan.uc.cn"):
+	case strings.Contains(urlLower, "drive.uc.cn"):
 		return "uc"
 	case strings.Contains(urlLower, "pan.baidu.com"):
 		return "baidu"
@@ -2239,61 +1446,17 @@ func normalizeLinkType(rawType string, rawURL string) string {
 		return "tianyi"
 	case strings.Contains(urlLower, "115.com"), strings.Contains(urlLower, "115cdn.com"), strings.Contains(urlLower, "anxia.com"):
 		return "115"
-	case strings.Contains(urlLower, "123pan.com"), strings.Contains(urlLower, "123pan.cn"), strings.Contains(urlLower, "123684.com"), strings.Contains(urlLower, "123685.com"), strings.Contains(urlLower, "123865.com"), strings.Contains(urlLower, "123912.com"), strings.Contains(urlLower, "123592.com"):
+	case strings.Contains(urlLower, "123pan.com"), strings.Contains(urlLower, "123684.com"), strings.Contains(urlLower, "123685.com"), strings.Contains(urlLower, "123865.com"), strings.Contains(urlLower, "123912.com"), strings.Contains(urlLower, "123592.com"):
 		return "123"
 	case strings.Contains(urlLower, "caiyun.139.com"), strings.Contains(urlLower, "yun.139.com"):
 		return "mobile"
-	case strings.Contains(urlLower, "guangyapan"):
-		return "guangya"
-	case strings.Contains(urlLower, "mypikpak.com"), strings.Contains(urlLower, "mypikpak.net"), strings.Contains(urlLower, "pikpakdrive.com"):
-		return "pikpak"
 	default:
 		return "others"
 	}
 }
 
-func isRealPanURL(value string) bool {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return false
-	}
-	return strings.HasPrefix(strings.ToLower(value), "http://") ||
-		strings.HasPrefix(strings.ToLower(value), "https://") ||
-		strings.HasPrefix(strings.ToLower(value), "magnet:") ||
-		strings.HasPrefix(strings.ToLower(value), "ed2k:") ||
-		strings.HasPrefix(strings.ToLower(value), "thunder:")
-}
-
-func normalizePanShareURL(rawURL string, linkType string) string {
-	clean := strings.TrimSpace(rawURL)
-	if clean == "" {
-		return ""
-	}
-
-	parsed, err := url.Parse(clean)
-	if err != nil || parsed.Hostname() == "" {
-		return clean
-	}
-	hostname := strings.ToLower(parsed.Hostname())
-	shareHost := pan123ShareHostRegex.MatchString(hostname)
-	pathParts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
-	if (normalizePanTypeName(linkType) == "123" || shareHost) && shareHost && len(pathParts) == 2 && strings.EqualFold(pathParts[0], "123pan") && pathParts[1] != "" {
-		normalized := &url.URL{Scheme: "https", Host: "123865.com", Path: "/s/" + pathParts[1]}
-		query := normalized.Query()
-		for _, key := range []string{"pwd", "pass", "password", "code"} {
-			if value := parsed.Query().Get(key); value != "" {
-				query.Set("pwd", value)
-				break
-			}
-		}
-		normalized.RawQuery = query.Encode()
-		return normalized.String()
-	}
-	return clean
-}
-
 func normalizePanURL(rawURL string, password string, linkType string) string {
-	clean := normalizePanShareURL(strings.TrimSpace(rawURL), linkType)
+	clean := strings.TrimSpace(rawURL)
 	clean = strings.TrimRight(clean, "#")
 	clean = extractCodeNoiseRegex.ReplaceAllString(clean, "")
 	clean = strings.TrimSpace(clean)
@@ -2447,15 +1610,6 @@ func respondError(c *gin.Context, message string) {
 	})
 }
 
-// respondErrorData 用于需要带结构化细节的失败：例如验证码错误时让前端自动换一张。
-func respondErrorData(c *gin.Context, message string, data interface{}) {
-	c.JSON(http.StatusOK, gin.H{
-		"success": false,
-		"message": message,
-		"data":    data,
-	})
-}
-
 func getEncryptionKey() []byte {
 	key := os.Getenv("PANLIAN_ENCRYPTION_KEY")
 	if key == "" {
@@ -2504,16 +1658,4 @@ func (p *PanlianPlugin) decryptPassword(encrypted string) (string, error) {
 		return "", err
 	}
 	return string(plaintext), nil
-}
-
-// saveUserOrLog 保存用户状态，失败时记录下来。
-//
-// 原先这几处都是 _ = p.saveUser(user)：内存状态已经更新，当前进程一切正常，
-// 但持久化失败时更改会在重启后丢失——新登录的用户会变回 pending、relogin 拿到的
-// cookie 会消失——而且没有任何线索。搜索本身已经成功，没法把错误回传给调用方，
-// 所以至少要让它在日志里可见。
-func (p *PanlianPlugin) saveUserOrLog(user *User) {
-	if err := p.saveUser(user); err != nil {
-		fmt.Printf("[PANLIAN] 保存用户状态失败（重启后可能丢失登录态）: %v\n", err)
-	}
 }

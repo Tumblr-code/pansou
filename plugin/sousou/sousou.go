@@ -3,6 +3,7 @@ package sousou
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -330,7 +331,7 @@ func absolutePansoURL(href string) string {
 
 func parsePansoDatetime(text string) time.Time {
 	for _, layout := range []string{"2006-01-02 15:04:05", "2006-01-02"} {
-		if match := sousouRe1.FindString(text); match != "" {
+		if match := regexp.MustCompile(`\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2}:\d{2})?`).FindString(text); match != "" {
 			if parsed, err := time.Parse(layout, match); err == nil {
 				return parsed
 			}
@@ -341,7 +342,7 @@ func parsePansoDatetime(text string) time.Time {
 
 func parsePansoPassword(selection *goquery.Selection) string {
 	text := strings.TrimSpace(selection.Text())
-	match := sousouRe2.FindStringSubmatch(text)
+	match := regexp.MustCompile(`(?i)(?:提取码|密码|pwd)[:：]?\s*([a-z0-9]{4})`).FindStringSubmatch(text)
 	if len(match) > 1 {
 		return match[1]
 	}
@@ -427,7 +428,7 @@ func (p *SousouAsyncPlugin) searchByType(client *http.Client, keyword string, di
 			}
 
 			// 读取响应体
-			respBody, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
+			respBody, err := io.ReadAll(resp.Body)
 			if err != nil {
 				debugLog("读取响应失败 (page %d, type %s): %v", pageNum, diskType, err)
 				errChan <- fmt.Errorf("read response body failed (page %d, type %s): %w", pageNum, diskType, err)
@@ -691,10 +692,3 @@ type SousouItem struct {
 	Weight      int         `json:"weight"`
 	Status      int         `json:"status"`
 }
-
-// 以下正则原先在函数内临时编译，每次调用都要重新解析模式；
-// 提到包级后只编译一次，匹配行为不变。
-var (
-	sousouRe1 = regexp.MustCompile(`\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2}:\d{2})?`)
-	sousouRe2 = regexp.MustCompile(`(?i)(?:提取码|密码|pwd)[:：]?\s*([a-z0-9]{4})`)
-)

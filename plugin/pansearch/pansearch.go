@@ -3,24 +3,18 @@ package pansearch
 import (
 	"context"
 	"fmt"
-	"html"
 	"io"
 	"net/http"
 	"net/url"
 	"regexp"
-	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/PuerkitoBio/goquery"
-
-	"pansou/config"
 	"pansou/model"
 	"pansou/plugin"
-	"pansou/util"
 	"pansou/util/json"
+	"sync/atomic"
 )
 
 // 预编译正则表达式
@@ -30,7 +24,6 @@ var (
 
 	// 从__NEXT_DATA__脚本中提取数据的正则表达式
 	nextDataRegex = regexp.MustCompile(`<script id="__NEXT_DATA__" type="application/json">(.*?)</script>`)
-	passwordRegex = regexp.MustCompile(`(?i)(?:提取码|访问码|密码|pwd|code)\s*[:=：]?\s*([0-9a-z]{4,8})`)
 
 	// 缓存相关变量
 	searchResultCache  = sync.Map{}
@@ -74,12 +67,12 @@ const (
 	BaseURLTemplate = "https://www.pansearch.me/_next/data/%s/search.json"
 
 	// 默认参数
-	DefaultTimeout = 15 * time.Second
+	DefaultTimeout = 6 * time.Second // 减少默认超时时间
 	PageSize       = 10
-	MaxResults     = 50
-	MaxConcurrent  = 4
+	MaxResults     = 1000
+	MaxConcurrent  = 200 // 增加最大并发数
 	MaxRetries     = 2
-	MaxAPIPages    = 5
+	MaxAPIPages    = 100 // API最大页数限制
 
 	// HTTP 客户端配置
 	MaxIdleConns          = 500 // 增加最大空闲连接数
@@ -229,6 +222,17 @@ func NewPanSearchPlugin() *PanSearchAsyncPlugin {
 		retries:         MaxRetries,
 	}
 
+	// 初始化时预热获取 buildId
+	go func() {
+		_, err := p.getBuildId()
+		if err != nil {
+			// fmt.Printf("预热获取 buildId 失败: %v\n", err)
+		}
+	}()
+
+	// 启动后台 buildId 更新器
+	go p.startBuildIdUpdater()
+
 	return p
 }
 
@@ -339,7 +343,7 @@ func (p *PanSearchAsyncPlugin) Priority() int {
 }
 
 // getBuildId 获取buildId，优先使用缓存
-func (p *PanSearchAsyncPlugin) getBuildId(client *http.Client) (string, error) {
+func (p *PanSearchAsyncPlugin) getBuildId() (string, error) {
 	// 检查缓存是否有效
 	buildIdMutex.RLock()
 	if buildIdCache != "" && time.Since(buildIdCacheTime) < BuildIdCacheDuration*time.Minute {
@@ -379,8 +383,6 @@ func (p *PanSearchAsyncPlugin) getBuildId(client *http.Client) (string, error) {
 	req.Header.Set("Connection", "keep-alive")
 	req.Header.Set("Upgrade-Insecure-Requests", "1")
 	req.Header.Set("Cache-Control", "max-age=0")
-
-	client = p.requestClient(client)
 
 	// 使用重试机制发送请求
 	var resp *http.Response
@@ -456,30 +458,12 @@ func (p *PanSearchAsyncPlugin) getBuildId(client *http.Client) (string, error) {
 
 // getBaseURL 获取完整的API基础URL
 func (p *PanSearchAsyncPlugin) getBaseURL(client *http.Client) (string, error) {
-	buildId, err := p.getBuildId(client)
+	buildId, err := p.getBuildId()
 	if err != nil {
 		return "", err
 	}
 
 	return fmt.Sprintf(BaseURLTemplate, buildId), nil
-}
-
-func (p *PanSearchAsyncPlugin) requestClient(fallback *http.Client) *http.Client {
-	proxyURL := ""
-	if config.AppConfig != nil {
-		proxyURL = panSearchFirstNonEmpty(config.AppConfig.ProxyURL, config.AppConfig.HTTPSProxyURL, config.AppConfig.HTTPProxyURL)
-	}
-	if proxyURL != "" {
-		client, err := util.NewHTTPClient(proxyURL)
-		if err == nil {
-			client.Timeout = p.timeout
-			return client
-		}
-	}
-	if fallback != nil {
-		return fallback
-	}
-	return &http.Client{Timeout: p.timeout}
 }
 
 // Search 执行搜索并返回结果（兼容性方法）
@@ -498,80 +482,260 @@ func (p *PanSearchAsyncPlugin) SearchWithResult(keyword string, ext map[string]i
 
 // doSearch 执行具体的搜索逻辑
 func (p *PanSearchAsyncPlugin) doSearch(client *http.Client, keyword string, ext map[string]interface{}) ([]model.SearchResult, error) {
-	keyword = strings.TrimSpace(keyword)
-	if keyword == "" {
-		return nil, fmt.Errorf("[%s] 关键词不能为空", p.Name())
-	}
-	client = p.requestClient(client)
-
+	// 获取API基础URL
 	baseURL, err := p.getBaseURL(client)
 	if err != nil {
-		return nil, fmt.Errorf("[%s] 获取API基础URL失败: %w", p.Name(), err)
+		return nil, fmt.Errorf("获取API基础URL失败: %w", err)
 	}
 
+	// 1. 发起首次请求获取total和第一页数据
 	firstPageResults, total, err := p.fetchFirstPage(keyword, baseURL, client)
 	if err != nil {
+		// 如果返回404错误，可能是buildId过期，尝试强制刷新buildId
 		if strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "Not Found") {
+			fmt.Println("检测到404错误，buildId可能已过期，尝试强制刷新")
+
+			// 强制刷新buildId
 			buildIdMutex.Lock()
-			buildIdCache = ""
-			buildIdCacheTime = time.Time{}
+			buildIdCache = ""              // 清空缓存
+			buildIdCacheTime = time.Time{} // 重置缓存时间
 			buildIdMutex.Unlock()
+
+			// 重新获取buildId
 			baseURL, err = p.getBaseURL(client)
 			if err != nil {
-				return nil, fmt.Errorf("[%s] 刷新 buildId 失败: %w", p.Name(), err)
+				return nil, fmt.Errorf("刷新buildId失败: %w", err)
 			}
+
+			// 重试请求
 			firstPageResults, total, err = p.fetchFirstPage(keyword, baseURL, client)
 			if err != nil {
-				return nil, fmt.Errorf("[%s] 刷新 buildId 后获取首页失败: %w", p.Name(), err)
+				return nil, fmt.Errorf("刷新buildId后获取首页仍然失败: %w", err)
 			}
+
+			// 成功刷新后，触发后台更新以保持最新状态
+			go p.updateBuildId()
 		} else {
-			return nil, fmt.Errorf("[%s] 获取首页失败: %w", p.Name(), err)
+			return nil, fmt.Errorf("获取首页失败: %w", err)
 		}
 	}
 
-	allResults := append([]PanSearchItem(nil), firstPageResults...)
-	pageCount := min((min(total, p.maxResults)+PageSize-1)/PageSize, MaxAPIPages)
-	if pageCount > 1 {
-		type pageResult struct {
-			offset int
-			items  []PanSearchItem
-		}
-		resultCh := make(chan pageResult, pageCount-1)
-		sem := make(chan struct{}, min(p.maxConcurrent, pageCount-1))
-		var wg sync.WaitGroup
+	allResults := firstPageResults
 
-		for page := 1; page < pageCount; page++ {
-			offset := page * PageSize
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				sem <- struct{}{}
-				defer func() { <-sem }()
-				items, pageErr := p.fetchPage(keyword, offset, baseURL, client)
-				if pageErr == nil {
-					resultCh <- pageResult{offset: offset, items: items}
+	// 2. 计算需要的页数，但限制在最大结果数内和API最大页数内
+	remainingResults := min(total-PageSize, p.maxResults-PageSize)
+	if remainingResults <= 0 {
+		results := p.convertResults(allResults, keyword)
+
+		// 缓存结果
+		searchResultCache.Store(keyword, cachedResponse{
+			results:   results,
+			timestamp: time.Now(),
+		})
+
+		return results, nil
+	}
+
+	// 计算需要的页数，考虑API的100页限制
+	neededPages := min((remainingResults+PageSize-1)/PageSize, MaxAPIPages-1) // 向上取整，减1是因为第一页已经获取
+
+	// 如果只需要获取少量页面，直接返回
+	if neededPages <= 0 {
+		results := p.convertResults(allResults, keyword)
+
+		// 缓存结果
+		searchResultCache.Store(keyword, cachedResponse{
+			results:   results,
+			timestamp: time.Now(),
+		})
+
+		return results, nil
+	}
+
+	// 根据实际页数确定并发数，但不超过最大并发数
+	actualConcurrent := min(neededPages, p.maxConcurrent)
+
+	// 工作池是单次请求的局部资源，避免并发请求共享状态
+	pool := NewWorkerPool(actualConcurrent, neededPages)
+
+	// 创建上下文用于管理所有请求
+	ctx, cancel := context.WithTimeout(context.Background(), p.timeout*2)
+	defer cancel()
+
+	// 创建一个标志，用于标记是否需要刷新buildId
+	needRefreshBuildId := &atomic.Bool{}
+
+	// 启动工作池
+	pool.Start(ctx, func(ctx context.Context, task Task) (TaskResult, error) {
+		var pageResults []PanSearchItem
+		var err error
+
+		for retry := 0; retry <= p.retries; retry++ {
+			// 如果有其他协程发现buildId过期，等待刷新完成
+			if needRefreshBuildId.Load() {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+
+			pageResults, err = p.fetchPage(task.keyword, task.offset, task.baseURL)
+			if err == nil {
+				break
+			}
+
+			// 如果返回404错误，可能是buildId过期
+			if strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "Not Found") {
+				// 标记需要刷新buildId
+				if !needRefreshBuildId.Load() {
+					needRefreshBuildId.Store(true)
+					// 在一个新的协程中刷新buildId
+					go func() {
+						buildIdMutex.Lock()
+						buildIdCache = ""              // 清空缓存
+						buildIdCacheTime = time.Time{} // 重置缓存时间
+						buildIdMutex.Unlock()
+
+						// 重新获取buildId
+						newBuildId, err := p.getBuildId()
+						if err == nil && newBuildId != "" {
+							// 更新baseURL
+							task.baseURL = fmt.Sprintf(BaseURLTemplate, newBuildId)
+							fmt.Printf("成功刷新buildId: %s\n", newBuildId)
+						}
+
+						// 重置标志
+						needRefreshBuildId.Store(false)
+					}()
 				}
-			}()
-		}
-		wg.Wait()
-		close(resultCh)
 
-		pages := make([]pageResult, 0, pageCount-1)
-		for page := range resultCh {
-			pages = append(pages, page)
+				// 等待刷新完成
+				for i := 0; i < 10 && needRefreshBuildId.Load(); i++ {
+					time.Sleep(100 * time.Millisecond)
+				}
+
+				// 如果还在刷新，报告错误
+				if needRefreshBuildId.Load() {
+					return TaskResult{}, fmt.Errorf("404错误，buildId可能已过期: %w", err)
+				}
+
+				// 刷新完成后重试
+				continue
+			}
+
+			if retry < p.retries {
+				// 指数退避重试
+				select {
+				case <-time.After(time.Duration(1<<retry) * 100 * time.Millisecond):
+					// 继续重试
+				case <-ctx.Done():
+					return TaskResult{}, ctx.Err()
+				}
+			}
 		}
-		sort.Slice(pages, func(i, j int) bool { return pages[i].offset < pages[j].offset })
-		for _, page := range pages {
-			allResults = append(allResults, page.items...)
+
+		if err != nil {
+			return TaskResult{}, fmt.Errorf("获取偏移量 %d 的结果失败: %w", task.offset, err)
+		}
+
+		return TaskResult{offset: task.offset, results: pageResults}, nil
+	})
+
+	// 提交任务计数器
+	submittedTasks := 0
+
+	// 提交所有任务
+	for i := 0; i < neededPages; i++ {
+		// 检查上下文是否已取消
+		select {
+		case <-ctx.Done():
+			// 上下文已取消，停止提交任务
+			goto CollectResults
+		default:
+			// 继续执行
+		}
+
+		offset := PageSize + i*PageSize
+		if offset < p.maxResults {
+			task := Task{
+				keyword: keyword,
+				offset:  offset,
+				baseURL: baseURL,
+			}
+
+			if !pool.Submit(task) {
+				fmt.Printf("无法提交任务，工作池可能已关闭\n")
+				goto CollectResults
+			}
+
+			submittedTasks++
 		}
 	}
 
+CollectResults:
+	// 关闭任务提交通道
+	go pool.Close()
+
+	// 收集结果
+	resultCount := 0
+	errorCount := 0
+	var lastError error
+
+	// 使用select非阻塞地收集结果和错误
+	for resultCount+errorCount < submittedTasks {
+		select {
+		case result, ok := <-pool.results:
+			if !ok {
+				// 结果通道已关闭
+				goto ProcessResults
+			}
+			allResults = append(allResults, result.results...)
+			resultCount++
+
+		case err, ok := <-pool.errors:
+			if !ok {
+				// 错误通道已关闭
+				goto ProcessResults
+			}
+			errorCount++
+			lastError = err
+
+		case <-ctx.Done():
+			// 上下文超时，返回已收集的结果
+			results := p.convertResults(allResults, keyword)
+
+			// 缓存结果（即使超时也缓存已获取的结果）
+			searchResultCache.Store(keyword, cachedResponse{
+				results:   results,
+				timestamp: time.Now(),
+			})
+
+			return results, fmt.Errorf("搜索超时: %w", ctx.Err())
+		}
+	}
+
+ProcessResults:
+	// 如果所有请求都失败且没有获得首页以外的结果，则返回错误
+	if submittedTasks > 0 && errorCount == submittedTasks && len(allResults) == len(firstPageResults) {
+		results := p.convertResults(allResults, keyword)
+
+		// 缓存结果（即使有错误也缓存已获取的结果）
+		searchResultCache.Store(keyword, cachedResponse{
+			results:   results,
+			timestamp: time.Now(),
+		})
+
+		return results, fmt.Errorf("所有后续页面请求失败: %v", lastError)
+	}
+
+	// 4. 去重和格式化结果
 	uniqueResults := p.deduplicateItems(allResults)
 	results := p.convertResults(uniqueResults, keyword)
+
+	// 缓存结果
 	searchResultCache.Store(keyword, cachedResponse{
 		results:   results,
 		timestamp: time.Now(),
 	})
+
 	return results, nil
 }
 
@@ -616,7 +780,7 @@ func (p *PanSearchAsyncPlugin) fetchFirstPage(keyword string, baseURL string, cl
 	}
 
 	// 读取响应体
-	respBody, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
+	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, 0, fmt.Errorf("读取响应失败: %w", err)
 	}
@@ -635,7 +799,7 @@ func (p *PanSearchAsyncPlugin) fetchFirstPage(keyword string, baseURL string, cl
 }
 
 // fetchPage 获取指定偏移量的页面
-func (p *PanSearchAsyncPlugin) fetchPage(keyword string, offset int, baseURL string, client *http.Client) ([]PanSearchItem, error) {
+func (p *PanSearchAsyncPlugin) fetchPage(keyword string, offset int, baseURL string) ([]PanSearchItem, error) {
 	// 构建请求URL
 	reqURL := fmt.Sprintf("%s?keyword=%s&offset=%d", baseURL, url.QueryEscape(keyword), offset)
 
@@ -659,7 +823,7 @@ func (p *PanSearchAsyncPlugin) fetchPage(keyword string, offset int, baseURL str
 	req.Header.Set("Pragma", "no-cache")
 
 	// 发送请求
-	resp, err := client.Do(req)
+	resp, err := p.GetClient().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("请求失败: %w", err)
 	}
@@ -675,7 +839,7 @@ func (p *PanSearchAsyncPlugin) fetchPage(keyword string, offset int, baseURL str
 	}
 
 	// 读取响应体
-	respBody, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
+	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("读取响应失败: %w", err)
 	}
@@ -712,46 +876,48 @@ func (p *PanSearchAsyncPlugin) convertResults(items []PanSearchItem, keyword str
 	results := make([]model.SearchResult, 0, len(items))
 
 	for _, item := range items {
+		// 提取链接和密码
 		linkInfo := extractLinkAndPassword(item.Content)
-		if linkInfo.URL == "" {
-			continue
+
+		// 获取链接类型，确保映射到系统支持的类型
+		linkType := item.Pan
+		// 将aliyundrive映射到aliyun
+		if linkType == "aliyundrive" {
+			linkType = "aliyun"
 		}
 
-		linkType := normalizePanSearchType(item.Pan, linkInfo.URL)
-		title := extractTitle(item.Content, keyword)
+		// 创建链接
 		link := model.Link{
-			Type:      linkType,
-			URL:       linkInfo.URL,
-			Password:  linkInfo.Password,
-			WorkTitle: title,
+			URL:      linkInfo.URL,
+			Type:     linkType,
+			Password: linkInfo.Password,
 		}
 
+		// 创建唯一ID
+		uniqueID := fmt.Sprintf("pansearch-%d", item.ID)
+
+		// 解析时间
 		var datetime time.Time
 		if item.Time != "" {
-			// 解析失败原先被丢弃：结果时间戳变成零值，随后在按时间筛选时被**静默排除**，
-			// 表现为"这条资源明明有却搜不到"。这里换一个常见格式再试，仍失败则记录原因。
-			parseErr := error(nil)
-			datetime, parseErr = time.Parse(time.RFC3339, item.Time)
-			if parseErr != nil {
-				datetime, parseErr = time.Parse("2006-01-02 15:04:05", item.Time)
-			}
-			if parseErr != nil {
-				fmt.Printf("[PANSEARCH] 时间解析失败，该条目将按无时间处理: %q | %v\n", item.Time, parseErr)
+			// 尝试解析时间，格式：2025-07-07T13:54:43+08:00
+			parsedTime, err := time.Parse(time.RFC3339, item.Time)
+			if err == nil {
+				datetime = parsedTime
 			}
 		}
 
-		result := model.SearchResult{
-			MessageID: fmt.Sprintf("%d", item.ID),
-			UniqueID:  fmt.Sprintf("%s-%d", p.Name(), item.ID),
-			Channel:   "",
-			Title:     title,
-			Content:   cleanHTML(item.Content),
-			Datetime:  datetime,
-			Links:     []model.Link{link},
-			Tags:      []string{linkType, p.Name()},
+		// 如果时间解析失败，使用零值
+		if datetime.IsZero() {
+			datetime = time.Time{}
 		}
-		if imageURL := strings.TrimSpace(item.Image); strings.HasPrefix(imageURL, "http://") || strings.HasPrefix(imageURL, "https://") {
-			result.Images = []string{imageURL}
+
+		// 创建搜索结果
+		result := model.SearchResult{
+			UniqueID: uniqueID,
+			Title:    extractTitle(item.Content, keyword),
+			Content:  item.Content,
+			Datetime: datetime,
+			Links:    []model.Link{link},
 		}
 
 		results = append(results, result)
@@ -768,34 +934,43 @@ type LinkInfo struct {
 
 // extractLinkAndPassword 从内容中提取链接和密码
 func extractLinkAndPassword(content string) LinkInfo {
-	doc, err := goquery.NewDocumentFromReader(strings.NewReader("<div>" + content + "</div>"))
-	if err != nil {
-		return LinkInfo{}
-	}
-	href, ok := doc.Find("a.resource-link, a[href]").First().Attr("href")
-	if !ok {
-		return LinkInfo{}
-	}
-	href = html.UnescapeString(strings.TrimSpace(href))
-	if !strings.HasPrefix(href, "http://") && !strings.HasPrefix(href, "https://") {
-		return LinkInfo{}
+	// 实现从内容中提取链接和密码的逻辑
+	// 这里需要解析HTML内容，提取<a>标签中的链接和密码
+	// 简单实现，实际可能需要使用正则表达式或HTML解析库
+
+	// 示例实现
+	linkInfo := LinkInfo{}
+
+	// 提取链接
+	linkStartIndex := strings.Index(content, "href=\"")
+	if linkStartIndex != -1 {
+		linkStartIndex += 6 // "href="的长度
+		linkEndIndex := strings.Index(content[linkStartIndex:], "\"")
+		if linkEndIndex != -1 {
+			linkInfo.URL = content[linkStartIndex : linkStartIndex+linkEndIndex]
+		}
 	}
 
-	password := ""
-	if parsed, parseErr := url.Parse(href); parseErr == nil {
-		for _, key := range []string{"pwd", "password", "passcode", "code"} {
-			if value := strings.TrimSpace(parsed.Query().Get(key)); value != "" {
-				password = value
-				break
+	// 提取密码
+	pwdIndex := strings.Index(content, "?pwd=")
+	if pwdIndex != -1 {
+		pwdStartIndex := pwdIndex + 5 // "?pwd="的长度
+		pwdEndIndex := strings.Index(content[pwdStartIndex:], "\"")
+		if pwdEndIndex != -1 {
+			linkInfo.Password = content[pwdStartIndex : pwdStartIndex+pwdEndIndex]
+		} else {
+			// 可能是百度网盘链接结尾形式
+			pwdEndIndex = strings.Index(content[pwdStartIndex:], "#")
+			if pwdEndIndex != -1 {
+				linkInfo.Password = content[pwdStartIndex : pwdStartIndex+pwdEndIndex]
+			} else {
+				// 取到结尾
+				linkInfo.Password = content[pwdStartIndex:]
 			}
 		}
 	}
-	if password == "" {
-		if match := passwordRegex.FindStringSubmatch(doc.Text()); len(match) > 1 {
-			password = match[1]
-		}
-	}
-	return LinkInfo{URL: strings.TrimRight(href, "#"), Password: password}
+
+	return linkInfo
 }
 
 // extractTitle 从内容中提取标题
@@ -818,66 +993,42 @@ func extractTitle(content string, keyword string) string {
 }
 
 // cleanHTML 清理HTML标签
-func cleanHTML(value string) string {
-	value = strings.NewReplacer("<br>", "\n", "<br/>", "\n", "<br />", "\n", "</p>", "\n").Replace(value)
-	doc, err := goquery.NewDocumentFromReader(strings.NewReader("<div>" + value + "</div>"))
-	if err != nil {
-		return strings.TrimSpace(html.UnescapeString(value))
+func cleanHTML(html string) string {
+	// 实现清理HTML标签的逻辑
+	// 这里简单实现，实际可能需要使用HTML解析库
+
+	// 替换常见HTML标签
+	replacements := map[string]string{
+		"<span class='highlight-keyword'>": "",
+		"</span>":                          "",
+		"<a class=\"resource-link\" target=\"_blank\" href=\"": "",
+		"</a>": "",
+		"<br>": "\n",
+		"<p>":  "",
+		"</p>": "\n",
 	}
-	lines := strings.Split(html.UnescapeString(doc.Text()), "\n")
-	cleaned := make([]string, 0, len(lines))
-	for _, line := range lines {
-		line = strings.Join(strings.Fields(line), " ")
-		if line != "" {
-			cleaned = append(cleaned, line)
+
+	result := html
+	for tag, replacement := range replacements {
+		result = strings.Replace(result, tag, replacement, -1)
+	}
+
+	// 清理其他HTML标签
+	for {
+		startIndex := strings.Index(result, "<")
+		if startIndex == -1 {
+			break
 		}
-	}
-	return strings.Join(cleaned, "\n")
-}
 
-func normalizePanSearchType(rawType string, rawURL string) string {
-	normalized := strings.ToLower(strings.TrimSpace(rawType))
-	switch normalized {
-	case "ali", "alipan", "aliyun", "aliyundrive":
-		return "aliyun"
-	case "quark", "uc", "baidu", "xunlei", "tianyi", "115", "123", "mobile", "pikpak":
-		return normalized
-	}
-
-	lowerURL := strings.ToLower(rawURL)
-	switch {
-	case strings.Contains(lowerURL, "pan.quark.cn"):
-		return "quark"
-	case strings.Contains(lowerURL, "drive.uc.cn"):
-		return "uc"
-	case strings.Contains(lowerURL, "pan.baidu.com"):
-		return "baidu"
-	case strings.Contains(lowerURL, "alipan.com"), strings.Contains(lowerURL, "aliyundrive.com"):
-		return "aliyun"
-	case strings.Contains(lowerURL, "pan.xunlei.com"):
-		return "xunlei"
-	case strings.Contains(lowerURL, "cloud.189.cn"):
-		return "tianyi"
-	case strings.Contains(lowerURL, "115.com"):
-		return "115"
-	case strings.Contains(lowerURL, "123pan"), strings.Contains(lowerURL, "123865.com"), strings.Contains(lowerURL, "123684.com"):
-		return "123"
-	case strings.Contains(lowerURL, "139.com"), strings.Contains(lowerURL, "10086.cn"):
-		return "mobile"
-	case strings.Contains(lowerURL, "pikpak"):
-		return "pikpak"
-	default:
-		return "others"
-	}
-}
-
-func panSearchFirstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
+		endIndex := strings.Index(result[startIndex:], ">")
+		if endIndex == -1 {
+			break
 		}
+
+		result = result[:startIndex] + result[startIndex+endIndex+1:]
 	}
-	return ""
+
+	return strings.TrimSpace(result)
 }
 
 // min 返回两个int中的较小值

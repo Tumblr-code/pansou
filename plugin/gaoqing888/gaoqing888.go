@@ -3,6 +3,7 @@ package gaoqing888
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -14,7 +15,6 @@ import (
 
 	"pansou/model"
 	"pansou/plugin"
-	"pansou/util"
 )
 
 const (
@@ -57,7 +57,6 @@ func NewGaoqing888Plugin() *Gaoqing888Plugin {
 		client: &http.Client{
 			Timeout: searchTimeout,
 			Transport: &http.Transport{
-				Proxy:               util.ProxyFuncForTransport(),
 				MaxIdleConns:        64,
 				MaxIdleConnsPerHost: 16,
 				MaxConnsPerHost:     24,
@@ -320,23 +319,15 @@ func fetchDocument(client *http.Client, requestURL string, timeout time.Duration
 }
 
 func fetchBody(client *http.Client, requestURL string, timeout time.Duration, referer string) ([]byte, error) {
-	var body []byte
-
-	// 重试逻辑收敛到 util.DoWithRetry。关键语义要点：原实现是"每次尝试各自建 context"，
-	// 即超时按尝试计算、而不是整轮共享一个——所以 ctx/cancel 必须建在闭包内（用 defer cancel
-	// 在闭包返回时释放，不会跨轮累积）。退避仍是 200ms × 2^attempt。
-	err := util.DoWithRetry(util.RetryConfig{
-		Attempts:   maxRetries,
-		BaseDelay:  200 * time.Millisecond,
-		Multiplier: 2,
-	}, func(_ int) error {
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 		if err != nil {
-			return err
+			cancel()
+			return nil, err
 		}
+
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 		req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
@@ -344,24 +335,24 @@ func fetchBody(client *http.Client, requestURL string, timeout time.Duration, re
 		req.Header.Set("Referer", referer)
 
 		resp, err := client.Do(req)
-		if err != nil {
-			return err
+		if err == nil && resp.StatusCode == http.StatusOK {
+			defer resp.Body.Close()
+			data, readErr := io.ReadAll(resp.Body)
+			cancel()
+			return data, readErr
 		}
-		if resp.StatusCode != http.StatusOK {
-			status := resp.StatusCode
+		if resp != nil {
 			resp.Body.Close()
-			return fmt.Errorf("HTTP %d", status)
 		}
-		data, readErr := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
-		resp.Body.Close()
-		if readErr != nil {
-			return readErr
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 		}
-		body = data
-		return nil
-	})
-	if err != nil {
-		return nil, err
+		cancel()
+		if attempt < maxRetries-1 {
+			time.Sleep(200 * time.Millisecond * time.Duration(1<<attempt))
+		}
 	}
-	return body, nil
+	return nil, lastErr
 }

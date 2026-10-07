@@ -3,9 +3,9 @@ package haisou
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
-	"pansou/util"
 	"regexp"
 	"strings"
 	"sync"
@@ -49,11 +49,11 @@ type SearchAPIResponse struct {
 
 // ShareItem 搜索结果项
 type ShareItem struct {
-	HSID      string `json:"hsid"`       // 海搜ID，用于获取具体链接
-	Platform  string `json:"platform"`   // 网盘类型
+	HSID      string `json:"hsid"`      // 海搜ID，用于获取具体链接
+	Platform  string `json:"platform"`  // 网盘类型
 	ShareName string `json:"share_name"` // 分享名称，可能包含HTML标签
-	StatFile  int    `json:"stat_file"`  // 文件数量
-	StatSize  int64  `json:"stat_size"`  // 总大小(字节)
+	StatFile  int    `json:"stat_file"` // 文件数量
+	StatSize  int64  `json:"stat_size"` // 总大小(字节)
 }
 
 // FetchAPIResponse 链接获取API响应结构
@@ -84,7 +84,7 @@ type LinkResult struct {
 
 func init() {
 	p := &HaisouPlugin{
-		BaseAsyncPlugin: plugin.NewBaseAsyncPlugin("haisou", 3),
+		BaseAsyncPlugin: plugin.NewBaseAsyncPlugin("haisou", 3), 
 	}
 	plugin.RegisterGlobalPlugin(p)
 }
@@ -348,7 +348,7 @@ func (p *HaisouPlugin) fetchSearchPage(client *http.Client, keyword string, page
 	}
 
 	// 读取响应体
-	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("[%s] %s网盘第%d页读取响应失败: %w", p.Name(), panType, pageNo, err)
 	}
@@ -410,7 +410,7 @@ func (p *HaisouPlugin) fetchShareLink(client *http.Client, hsid string, platform
 	}
 
 	// 读取响应体
-	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", "", fmt.Errorf("[%s] hsid=%s读取响应失败: %w", p.Name(), hsid, err)
 	}
@@ -466,14 +466,7 @@ func (p *HaisouPlugin) doRequestWithRetry(req *http.Request, client *http.Client
 		}
 
 		if resp != nil {
-			status := resp.StatusCode
 			resp.Body.Close()
-			if err == nil {
-				// Do 成功但状态码非 200。此前这里只执行 lastErr = err，
-				// err 为 nil 时会把 lastErr 清空，三次失败后仅报出
-				// "%!w(<nil>)"，真实状态码被丢掉、无法定位失败原因。
-				err = fmt.Errorf("HTTP 状态码 %d", status)
-			}
 		}
 		lastErr = err
 	}
@@ -520,11 +513,11 @@ func mapPlatformType(platform string) string {
 // cleanHTMLTags 清理HTML标签
 func cleanHTMLTags(text string) string {
 	// 移除高亮标签 <span class="highlight">...</span>
-	re := haisouRe1
+	re := regexp.MustCompile(`<span[^>]*class="highlight"[^>]*>(.*?)</span>`)
 	cleaned := re.ReplaceAllString(text, "$1")
 
 	// 移除其他可能的HTML标签
-	re2 := haisouRe2
+	re2 := regexp.MustCompile(`<[^>]*>`)
 	cleaned = re2.ReplaceAllString(cleaned, "")
 
 	return strings.TrimSpace(cleaned)
@@ -553,10 +546,3 @@ func formatSize(size int64) string {
 		return fmt.Sprintf("%d B", size)
 	}
 }
-
-// 以下正则原先在函数内临时编译，每次调用都要重新解析模式；
-// 提到包级后只编译一次，匹配行为不变。
-var (
-	haisouRe1 = regexp.MustCompile(`<span[^>]*class="highlight"[^>]*>(.*?)</span>`)
-	haisouRe2 = regexp.MustCompile(`<[^>]*>`)
-)

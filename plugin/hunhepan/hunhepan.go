@@ -3,9 +3,9 @@ package hunhepan
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
-	"pansou/util"
 	"strings"
 	"sync"
 	"time"
@@ -69,7 +69,7 @@ func (p *HunhepanAsyncPlugin) SearchWithResult(keyword string, ext map[string]in
 // doSearch 实际的搜索实现
 func (p *HunhepanAsyncPlugin) doSearch(client *http.Client, keyword string, ext map[string]interface{}) ([]model.SearchResult, error) {
 	debugLog("开始搜索，关键词: %s", keyword)
-
+	
 	// 创建结果通道和错误通道
 	resultChan := make(chan []HunhepanItem, 4)
 	errChan := make(chan error, 4)
@@ -241,7 +241,7 @@ func (p *HunhepanAsyncPlugin) searchAPI(client *http.Client, apiURL, keyword str
 			debugLog("收到响应 (page %d), 状态码: %d", pageNum, resp.StatusCode)
 
 			// 读取响应体
-			respBody, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
+			respBody, err := io.ReadAll(resp.Body)
 			if err != nil {
 				debugLog("读取响应失败 (page %d): %v", pageNum, err)
 				errChan <- fmt.Errorf("read response body failed (page %d): %w", pageNum, err)

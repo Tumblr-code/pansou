@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"html"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -175,7 +176,7 @@ func (p *YunsoAsyncPlugin) searchPage(client *http.Client, keyword string, page 
 		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read response failed: %w", err)
 	}
@@ -226,7 +227,7 @@ func (p *YunsoAsyncPlugin) parseItems(fragment string) ([]YunsoItem, error) {
 		item := YunsoItem{
 			Title:        title,
 			EncryptedURL: strings.TrimSpace(encryptedURL),
-			URL:          decryptedURL,
+			URL:          strings.TrimSpace(decryptedURL),
 			Preview:      cleanYunsoText(card.Find("p.result.container.p").First().Text()),
 			FileSummary:  fileSummary,
 			Datetime:     parseYunsoDatetime(card.Find(".layui-card-header").Text()),
@@ -381,7 +382,7 @@ func decryptYunsoURL(value string) (string, error) {
 	// Newer responses expose the share URL directly. Keep the legacy
 	// base64/XOR path below for older results.
 	if strings.HasPrefix(strings.ToLower(value), "http://") || strings.HasPrefix(strings.ToLower(value), "https://") {
-		return normalizeYunsoURL(value), nil
+		return value, nil
 	}
 
 	decoded, err := decodeYunsoBase64(value)
@@ -391,7 +392,7 @@ func decryptYunsoURL(value string) (string, error) {
 
 	rawText := strings.TrimSpace(string(decoded))
 	if strings.HasPrefix(rawText, "http://") || strings.HasPrefix(rawText, "https://") {
-		return normalizeYunsoURL(rawText), nil
+		return rawText, nil
 	}
 
 	result := make([]byte, len(decoded))
@@ -399,19 +400,7 @@ func decryptYunsoURL(value string) (string, error) {
 		result[i] = decoded[i] ^ yunsoDecryptBytes[i%len(yunsoDecryptBytes)]
 	}
 
-	return normalizeYunsoURL(string(result)), nil
-}
-
-// normalizeYunsoURL 去除上游模板留下的空查询符，保留真实参数和片段。
-// 在解密后统一处理，确保链接分类、密码提取和去重使用相同的 URL。
-func normalizeYunsoURL(value string) string {
-	value = strings.TrimSpace(value)
-	u, err := url.Parse(value)
-	if err != nil || !u.ForceQuery || u.RawQuery != "" {
-		return value
-	}
-	u.ForceQuery = false
-	return u.String()
+	return strings.TrimSpace(string(result)), nil
 }
 
 func decodeYunsoBase64(value string) ([]byte, error) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/md5"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -54,7 +55,6 @@ type FeikuaiPlugin struct {
 // createOptimizedHTTPClient 创建优化的HTTP客户端
 func createOptimizedHTTPClient() *http.Client {
 	transport := &http.Transport{
-		Proxy:               util.ProxyFuncForTransport(),
 		MaxIdleConns:        MaxIdleConns,
 		MaxIdleConnsPerHost: MaxIdleConnsPerHost,
 		MaxConnsPerHost:     MaxConnsPerHost,
@@ -134,7 +134,7 @@ func (p *FeikuaiPlugin) searchImpl(client *http.Client, keyword string, ext map[
 	}
 
 	// 读取并解析JSON响应
-	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return p.searchWeb(client, keyword, fmt.Errorf("[%s] 读取 API 响应失败: %w", p.Name(), err))
 	}
@@ -264,14 +264,14 @@ func extractWebPassword(linkURL, content string) string {
 			return pwd
 		}
 	}
-	if match := feikuaiRe1.FindStringSubmatch(content); len(match) > 1 {
+	if match := regexp.MustCompile(`(?i)(?:提取码|密码|pwd)[:：]?\s*([a-z0-9]{4})`).FindStringSubmatch(content); len(match) > 1 {
 		return match[1]
 	}
 	return ""
 }
 
 func parseFeikuaiWebTime(text string) time.Time {
-	match := feikuaiRe2.FindString(text)
+	match := regexp.MustCompile(`\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2})?`).FindString(text)
 	if match == "" {
 		return time.Time{}
 	}
@@ -543,10 +543,3 @@ func (p *FeikuaiPlugin) doRequestWithRetry(req *http.Request, client *http.Clien
 
 	return nil, fmt.Errorf("[%s] 重试 %d 次后仍然失败: %w", p.Name(), maxRetries, lastErr)
 }
-
-// 以下正则原先在函数内临时编译，每次调用都要重新解析模式；
-// 提到包级后只编译一次，匹配行为不变。
-var (
-	feikuaiRe1 = regexp.MustCompile(`(?i)(?:提取码|密码|pwd)[:：]?\s*([a-z0-9]{4})`)
-	feikuaiRe2 = regexp.MustCompile(`\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2})?`)
-)
