@@ -2,11 +2,9 @@ package qiwei
 
 import (
 	"context"
-	"crypto/md5"
-	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
-	"net/http/cookiejar"
 	"net/url"
 	"regexp"
 	"sort"
@@ -17,7 +15,6 @@ import (
 	"github.com/PuerkitoBio/goquery"
 	"pansou/model"
 	"pansou/plugin"
-	"pansou/util"
 	"pansou/util/json"
 )
 
@@ -35,16 +32,11 @@ const (
 
 var (
 	qiweiHosts = []string{
-		"https://www.qmp4.com",
-		"https://www.gmp4.com",
-		"https://www.qwmp4.com",
-		"https://www.qwmkv.com",
+		"https://www.qnmp4.com",
 		"https://www.qwfilm.com",
-		"https://www.qwfun.com",
-		"https://www.qwshow.com",
-		"https://www.qnnull.com",
-		"https://www.qnhot.com",
-		"https://www.qncool.com",
+		"https://www.qwmkv.com",
+		"https://www.qwnull.com",
+		"https://www.qn63.com",
 	}
 
 	whitespaceRegex = regexp.MustCompile(`\s+`)
@@ -55,12 +47,7 @@ var (
 		regexp.MustCompile(`(?i)(?:提取码|密码|pwd)[：:\s]*([a-z0-9]{4,8})`),
 		regexp.MustCompile(`(?i)\?pwd=([a-z0-9]{4,8})`),
 	}
-	highValueKeywords         = []string{"杜比", "dolby", "原盘", "高码", "remux", "蓝光", "hdr10+", "hdr10", "hdr", "4k", "2160p", "uhd"}
-	verificationScriptRegex   = regexp.MustCompile(`(?i)<script[^>]+src=["']([^"']*huadong_[^"']+\.js[^"']*)`)
-	verificationTypeRegex     = regexp.MustCompile(`(?i)type=([a-f0-9]{32})`)
-	verificationKeyRegex      = regexp.MustCompile(`(?i)key=["']([a-f0-9]{32})["']`)
-	verificationValueRegex    = regexp.MustCompile(`(?i)value=["']([^"']+)["']`)
-	verificationEndpointRegex = regexp.MustCompile(`(?i)/([a-z0-9_]+_yanzheng_huadong\.php)\?type=`)
+	highValueKeywords = []string{"杜比", "dolby", "原盘", "高码", "remux", "蓝光", "hdr10+", "hdr10", "hdr", "4k", "2160p", "uhd"}
 )
 
 type suggestResponse struct {
@@ -104,7 +91,6 @@ func init() {
 
 func NewQiweiPlugin() *QiweiPlugin {
 	transport := &http.Transport{
-		Proxy:               util.ProxyFuncForTransport(),
 		MaxIdleConns:        120,
 		MaxIdleConnsPerHost: 24,
 		MaxConnsPerHost:     36,
@@ -112,14 +98,12 @@ func NewQiweiPlugin() *QiweiPlugin {
 		DisableKeepAlives:   false,
 		ForceAttemptHTTP2:   true,
 	}
-	jar, _ := cookiejar.New(nil)
 
 	return &QiweiPlugin{
 		BaseAsyncPlugin: plugin.NewBaseAsyncPlugin(pluginName, defaultPriority),
 		client: &http.Client{
 			Timeout:   searchTimeout,
 			Transport: transport,
-			Jar:       jar,
 		},
 		activeHost: qiweiHosts[0],
 	}
@@ -194,16 +178,7 @@ func (p *QiweiPlugin) searchSuggest(client *http.Client, host, keyword string) (
 		return nil, err
 	}
 	if isVerifyPage(body) {
-		if err := p.solveVerification(client, searchURL, body); err != nil {
-			return nil, fmt.Errorf("[%s] 搜索验证失败: %w", p.Name(), err)
-		}
-		body, err = p.fetchBody(client, searchURL, host+"/", searchTimeout)
-		if err != nil {
-			return nil, err
-		}
-		if isVerifyPage(body) {
-			return nil, fmt.Errorf("[%s] 命中验证页: %s", p.Name(), host)
-		}
+		return nil, fmt.Errorf("[%s] 命中验证页: %s", p.Name(), host)
 	}
 
 	var resp suggestResponse
@@ -315,19 +290,8 @@ func (p *QiweiPlugin) getDetailInfo(client *http.Client, detailURL, fallbackTitl
 			continue
 		}
 		if isVerifyPage(body) {
-			if verifyErr := p.solveVerification(client, candidateURL, body); verifyErr != nil {
-				lastErr = fmt.Errorf("[%s] 详情页验证失败: %w", p.Name(), verifyErr)
-				continue
-			}
-			body, err = p.fetchBody(client, candidateURL, candidateURL, detailTimeout)
-			if err != nil {
-				lastErr = err
-				continue
-			}
-			if isVerifyPage(body) {
-				lastErr = fmt.Errorf("[%s] 详情页验证未通过: %s", p.Name(), candidateURL)
-				continue
-			}
+			lastErr = fmt.Errorf("[%s] 详情页命中验证: %s", p.Name(), candidateURL)
+			continue
 		}
 
 		info, err := p.parseDetail(candidateURL, body, fallbackTitle, fallbackPic)
@@ -344,75 +308,6 @@ func (p *QiweiPlugin) getDetailInfo(client *http.Client, detailURL, fallbackTitl
 		lastErr = fmt.Errorf("[%s] 获取详情失败: %s", p.Name(), detailURL)
 	}
 	return detailInfo{}, lastErr
-}
-
-// solveVerification completes the site's deterministic slider challenge. The
-// challenge is session-bound, so the caller and this method must share a
-// cookie jar on the same http.Client.
-func (p *QiweiPlugin) solveVerification(client *http.Client, pageURL, verifyHTML string) error {
-	scriptMatch := verificationScriptRegex.FindStringSubmatch(verifyHTML)
-	if len(scriptMatch) < 2 {
-		return fmt.Errorf("未找到滑动验证脚本")
-	}
-	scriptURL := normalizeURL(pageURL, scriptMatch[1])
-	jsBody, err := p.fetchBody(client, scriptURL, pageURL, detailTimeout)
-	if err != nil {
-		return fmt.Errorf("获取验证脚本失败: %w", err)
-	}
-
-	typeMatch := verificationTypeRegex.FindStringSubmatch(jsBody)
-	keyMatch := verificationKeyRegex.FindStringSubmatch(jsBody)
-	valueMatch := verificationValueRegex.FindStringSubmatch(jsBody)
-	if len(typeMatch) < 2 || len(keyMatch) < 2 || len(valueMatch) < 2 {
-		return fmt.Errorf("验证脚本参数不完整")
-	}
-
-	encodedValue := md5StringToHex(valueMatch[1])
-	endpointPath := "/a20be899_96a6_40b2_88ba_32f1f75f1552_yanzheng_huadong.php"
-	if endpointMatch := verificationEndpointRegex.FindStringSubmatch(jsBody); len(endpointMatch) > 1 {
-		endpointPath = "/" + endpointMatch[1]
-	}
-	parsedPage, err := url.Parse(pageURL)
-	if err != nil {
-		return fmt.Errorf("验证页面地址无效: %w", err)
-	}
-	verifyURL := (&url.URL{Scheme: parsedPage.Scheme, Host: parsedPage.Host, Path: endpointPath}).String()
-	query := url.Values{}
-	query.Set("type", typeMatch[1])
-	query.Set("key", keyMatch[1])
-	query.Set("value", encodedValue)
-	verifyURL += "?" + query.Encode()
-
-	ctx, cancel := context.WithTimeout(context.Background(), detailTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, verifyURL, nil)
-	if err != nil {
-		return fmt.Errorf("创建验证请求失败: %w", err)
-	}
-	p.setHeaders(req, pageURL)
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	resp, err := p.doRequestWithRetry(req, client)
-	if err != nil {
-		return fmt.Errorf("提交验证失败: %w", err)
-	}
-	defer resp.Body.Close()
-	responseBody, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
-	if err != nil {
-		return fmt.Errorf("读取验证响应失败: %w", err)
-	}
-	if isVerifyPage(string(responseBody)) {
-		return fmt.Errorf("站点未接受验证参数")
-	}
-	return nil
-}
-
-func md5StringToHex(value string) string {
-	var builder strings.Builder
-	for _, r := range value {
-		builder.WriteString(fmt.Sprintf("%d", r+1))
-	}
-	sum := md5.Sum([]byte(builder.String()))
-	return hex.EncodeToString(sum[:])
 }
 
 func (p *QiweiPlugin) parseDetail(detailURL, body, fallbackTitle, fallbackPic string) (detailInfo, error) {
@@ -629,7 +524,7 @@ func (p *QiweiPlugin) fetchBody(client *http.Client, requestURL, referer string,
 		return "", fmt.Errorf("[%s] HTTP状态码异常: %d url=%s", p.Name(), resp.StatusCode, requestURL)
 	}
 
-	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", fmt.Errorf("[%s] 读取响应失败: %w", p.Name(), err)
 	}
@@ -651,14 +546,7 @@ func (p *QiweiPlugin) doRequestWithRetry(req *http.Request, client *http.Client)
 			return resp, nil
 		}
 		if resp != nil {
-			status := resp.StatusCode
 			resp.Body.Close()
-			if err == nil {
-				// Do 成功但状态码非 200。此前这里只执行 lastErr = err，
-				// err 为 nil 时会把 lastErr 清空，三次失败后仅报出
-				// "%!w(<nil>)"，真实状态码被丢掉、无法定位失败原因。
-				err = fmt.Errorf("HTTP 状态码 %d", status)
-			}
 		}
 		lastErr = err
 	}

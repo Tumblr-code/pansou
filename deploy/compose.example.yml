@@ -1,0 +1,9 @@
+services:
+  pansou:
+    image: ghcr.io/tumblr-code/pansou:v1.0.0
+    ports: ["127.0.0.1:8888:8888"]
+    env_file: [pansou.env]
+    environment:
+      CACHE_PATH: /app/cache
+    volumes: ["./cache:/app/cache"]
+    restart: unless-stopped

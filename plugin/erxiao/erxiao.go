@@ -1,20 +1,19 @@
 package erxiao
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
+	"context"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/PuerkitoBio/goquery"
 	"pansou/model"
 	"pansou/plugin"
-	"pansou/util"
 )
 
 const (
@@ -35,19 +34,14 @@ const (
 	cacheTTL = 1 * time.Hour
 )
 
-var sourceURLs = []string{
-	"https://www.wexwp.cc",
-	"https://www.2xiaopan.top",
-}
-
 // 性能统计（原子操作）
 var (
-	searchRequests     int64 = 0
-	totalSearchTime    int64 = 0 // 纳秒
+	searchRequests    int64 = 0
+	totalSearchTime   int64 = 0 // 纳秒
 	detailPageRequests int64 = 0
-	totalDetailTime    int64 = 0 // 纳秒
-	cacheHits          int64 = 0
-	cacheMisses        int64 = 0
+	totalDetailTime   int64 = 0 // 纳秒
+	cacheHits         int64 = 0
+	cacheMisses       int64 = 0
 )
 
 // Detail page缓存
@@ -69,19 +63,20 @@ var (
 	detailIDRegex = regexp.MustCompile(`/id/(\d+)`)
 
 	// 常见网盘链接的正则表达式（支持16种类型）
-	quarkLinkRegex  = regexp.MustCompile(`https?://pan\.quark\.cn/s/[0-9a-zA-Z]+`)
-	ucLinkRegex     = regexp.MustCompile(`https?://drive\.uc\.cn/s/[0-9a-zA-Z]+(\?[^"'\s]*)?`)
-	baiduLinkRegex  = regexp.MustCompile(`https?://pan\.baidu\.com/s/[0-9a-zA-Z_\-]+(\?pwd=[0-9a-zA-Z]+)?`)
-	aliyunLinkRegex = regexp.MustCompile(`https?://(www\.)?(aliyundrive\.com|alipan\.com)/s/[0-9a-zA-Z]+`)
-	xunleiLinkRegex = regexp.MustCompile(`https?://pan\.xunlei\.com/s/[0-9a-zA-Z_\-]+(\?pwd=[0-9a-zA-Z]+)?`)
-	tianyiLinkRegex = regexp.MustCompile(`https?://cloud\.189\.cn/t/[0-9a-zA-Z]+`)
-	link115Regex    = regexp.MustCompile(`https?://115\.com/s/[0-9a-zA-Z]+`)
-	mobileLinkRegex = regexp.MustCompile(`https?://caiyun\.feixin\.10086\.cn/[0-9a-zA-Z]+`)
-	link123Regex    = regexp.MustCompile(`https?://123pan\.com/s/[0-9a-zA-Z]+`)
-	pikpakLinkRegex = regexp.MustCompile(`https?://mypikpak\.com/s/[0-9a-zA-Z]+`)
-	magnetLinkRegex = regexp.MustCompile(`magnet:\?xt=urn:btih:[0-9a-fA-F]{40}`)
-	ed2kLinkRegex   = regexp.MustCompile(`ed2k://\|file\|.+\|\d+\|[0-9a-fA-F]{32}\|/`)
+	quarkLinkRegex     = regexp.MustCompile(`https?://pan\.quark\.cn/s/[0-9a-zA-Z]+`)
+	ucLinkRegex        = regexp.MustCompile(`https?://drive\.uc\.cn/s/[0-9a-zA-Z]+(\?[^"'\s]*)?`)
+	baiduLinkRegex     = regexp.MustCompile(`https?://pan\.baidu\.com/s/[0-9a-zA-Z_\-]+(\?pwd=[0-9a-zA-Z]+)?`)
+	aliyunLinkRegex    = regexp.MustCompile(`https?://(www\.)?(aliyundrive\.com|alipan\.com)/s/[0-9a-zA-Z]+`)
+	xunleiLinkRegex    = regexp.MustCompile(`https?://pan\.xunlei\.com/s/[0-9a-zA-Z_\-]+(\?pwd=[0-9a-zA-Z]+)?`)
+	tianyiLinkRegex    = regexp.MustCompile(`https?://cloud\.189\.cn/t/[0-9a-zA-Z]+`)
+	link115Regex       = regexp.MustCompile(`https?://115\.com/s/[0-9a-zA-Z]+`)
+	mobileLinkRegex    = regexp.MustCompile(`https?://caiyun\.feixin\.10086\.cn/[0-9a-zA-Z]+`)
+	link123Regex       = regexp.MustCompile(`https?://123pan\.com/s/[0-9a-zA-Z]+`)
+	pikpakLinkRegex    = regexp.MustCompile(`https?://mypikpak\.com/s/[0-9a-zA-Z]+`)
+	magnetLinkRegex    = regexp.MustCompile(`magnet:\?xt=urn:btih:[0-9a-fA-F]{40}`)
+	ed2kLinkRegex      = regexp.MustCompile(`ed2k://\|file\|.+\|\d+\|[0-9a-fA-F]{32}\|/`)
 )
+
 
 type ErxiaoAsyncPlugin struct {
 	*plugin.BaseAsyncPlugin
@@ -91,7 +86,6 @@ type ErxiaoAsyncPlugin struct {
 // createOptimizedHTTPClient 创建优化的HTTP客户端
 func createOptimizedHTTPClient() *http.Client {
 	transport := &http.Transport{
-		Proxy:               util.ProxyFuncForTransport(),
 		MaxIdleConns:        MaxIdleConns,
 		MaxIdleConnsPerHost: MaxIdleConnsPerHost,
 		MaxConnsPerHost:     MaxConnsPerHost,
@@ -141,56 +135,8 @@ func (p *ErxiaoAsyncPlugin) searchImpl(client *http.Client, keyword string, ext 
 		client = p.optimizedClient
 	}
 
-	var results []model.SearchResult
-	var selectedBase string
-	var emptyBase string
-	var lastErr error
-	type sourceResult struct {
-		base    string
-		results []model.SearchResult
-		err     error
-	}
-	resultCh := make(chan sourceResult, len(sourceURLs))
-	for _, baseURL := range sourceURLs {
-		go func(base string) {
-			candidate, err := p.searchAtBase(client, keyword, base)
-			resultCh <- sourceResult{base: base, results: candidate, err: err}
-		}(baseURL)
-	}
-	for range sourceURLs {
-		candidate := <-resultCh
-		if candidate.err != nil {
-			lastErr = candidate.err
-			continue
-		}
-		if emptyBase == "" {
-			emptyBase = candidate.base
-		}
-		if len(candidate.results) > 0 {
-			results = candidate.results
-			selectedBase = candidate.base
-			break
-		}
-	}
-	if selectedBase == "" {
-		selectedBase = emptyBase
-	}
-	if selectedBase == "" {
-		if lastErr != nil {
-			return nil, fmt.Errorf("[%s] 搜索请求失败: %w", p.Name(), lastErr)
-		}
-		return []model.SearchResult{}, nil
-	}
-
-	// 8. 异步获取详情页信息
-	enhancedResults := p.enhanceWithDetails(client, results, selectedBase)
-
-	// 9. 关键词过滤
-	return plugin.FilterResultsByKeyword(enhancedResults, keyword), nil
-}
-
-func (p *ErxiaoAsyncPlugin) searchAtBase(client *http.Client, keyword, baseURL string) ([]model.SearchResult, error) {
-	searchURL := fmt.Sprintf("%s/index.php/vod/search/wd/%s.html", strings.TrimRight(baseURL, "/"), url.QueryEscape(keyword))
+	// 1. 构建搜索URL
+	searchURL := fmt.Sprintf("https://erxiaofn.click/index.php/vod/search/wd/%s.html", url.QueryEscape(keyword))
 
 	// 2. 创建带超时的上下文
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
@@ -207,7 +153,7 @@ func (p *ErxiaoAsyncPlugin) searchAtBase(client *http.Client, keyword, baseURL s
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
 	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("Referer", strings.TrimRight(baseURL, "/")+"/")
+	req.Header.Set("Referer", "https://erxiaofn.click/")
 
 	// 5. 发送请求
 	resp, err := p.doRequestWithRetry(req, client)
@@ -236,7 +182,11 @@ func (p *ErxiaoAsyncPlugin) searchAtBase(client *http.Client, keyword, baseURL s
 		}
 	})
 
-	return results, nil
+	// 8. 异步获取详情页信息
+	enhancedResults := p.enhanceWithDetails(client, results)
+
+	// 9. 关键词过滤
+	return plugin.FilterResultsByKeyword(enhancedResults, keyword), nil
 }
 
 // parseSearchItem 解析单个搜索结果项
@@ -334,14 +284,14 @@ func (p *ErxiaoAsyncPlugin) parseSearchItem(s *goquery.Selection, keyword string
 	result.Title = title
 	result.Content = content
 	result.Tags = tags
-	result.Channel = ""           // 插件搜索结果Channel为空
+	result.Channel = "" // 插件搜索结果Channel为空
 	result.Datetime = time.Time{} // 使用零值
 
 	return result
 }
 
 // enhanceWithDetails 异步获取详情页信息
-func (p *ErxiaoAsyncPlugin) enhanceWithDetails(client *http.Client, results []model.SearchResult, baseURL string) []model.SearchResult {
+func (p *ErxiaoAsyncPlugin) enhanceWithDetails(client *http.Client, results []model.SearchResult) []model.SearchResult {
 	var enhancedResults []model.SearchResult
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -365,10 +315,9 @@ func (p *ErxiaoAsyncPlugin) enhanceWithDetails(client *http.Client, results []mo
 				return
 			}
 			itemID := parts[1]
-			cacheKey := strings.TrimRight(baseURL, "/") + "|" + itemID
 
 			// 检查缓存
-			if cached, ok := detailCache.Load(cacheKey); ok {
+			if cached, ok := detailCache.Load(itemID); ok {
 				atomic.AddInt64(&cacheHits, 1)
 				r := cached.(model.SearchResult)
 				mu.Lock()
@@ -380,7 +329,7 @@ func (p *ErxiaoAsyncPlugin) enhanceWithDetails(client *http.Client, results []mo
 			atomic.AddInt64(&cacheMisses, 1)
 
 			// 获取详情页链接和图片
-			detailLinks, detailImages := p.fetchDetailLinksAndImages(client, baseURL, itemID)
+			detailLinks, detailImages := p.fetchDetailLinksAndImages(client, itemID)
 			result.Links = detailLinks
 
 			// 合并图片：优先使用详情页的海报，如果没有则使用搜索结果的图片
@@ -389,7 +338,7 @@ func (p *ErxiaoAsyncPlugin) enhanceWithDetails(client *http.Client, results []mo
 			}
 
 			// 缓存结果
-			detailCache.Store(cacheKey, result)
+			detailCache.Store(itemID, result)
 
 			mu.Lock()
 			enhancedResults = append(enhancedResults, result)
@@ -402,7 +351,7 @@ func (p *ErxiaoAsyncPlugin) enhanceWithDetails(client *http.Client, results []mo
 }
 
 // fetchDetailLinksAndImages 获取详情页的下载链接和图片
-func (p *ErxiaoAsyncPlugin) fetchDetailLinksAndImages(client *http.Client, baseURL, itemID string) ([]model.Link, []string) {
+func (p *ErxiaoAsyncPlugin) fetchDetailLinksAndImages(client *http.Client, itemID string) ([]model.Link, []string) {
 	// 性能统计
 	start := time.Now()
 	atomic.AddInt64(&detailPageRequests, 1)
@@ -411,7 +360,7 @@ func (p *ErxiaoAsyncPlugin) fetchDetailLinksAndImages(client *http.Client, baseU
 		atomic.AddInt64(&totalDetailTime, duration)
 	}()
 
-	detailURL := fmt.Sprintf("%s/index.php/vod/detail/id/%s.html", strings.TrimRight(baseURL, "/"), itemID)
+	detailURL := fmt.Sprintf("https://erxiaofn.click/index.php/vod/detail/id/%s.html", itemID)
 
 	// 创建带超时的上下文
 	ctx, cancel := context.WithTimeout(context.Background(), DetailTimeout)
@@ -428,7 +377,7 @@ func (p *ErxiaoAsyncPlugin) fetchDetailLinksAndImages(client *http.Client, baseU
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
 	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("Referer", strings.TrimRight(baseURL, "/")+"/")
+	req.Header.Set("Referer", "https://erxiaofn.click/")
 
 	// 发送请求（带重试）
 	resp, err := p.doRequestWithRetry(req, client)
@@ -478,13 +427,14 @@ func (p *ErxiaoAsyncPlugin) fetchDetailLinksAndImages(client *http.Client, baseU
 // isValidNetworkDriveURL 验证是否为有效的网盘URL
 func (p *ErxiaoAsyncPlugin) isValidNetworkDriveURL(url string) bool {
 	if strings.Contains(url, "javascript:") ||
-		strings.Contains(url, "#") ||
-		url == "" ||
-		(!strings.HasPrefix(url, "http") && !strings.HasPrefix(url, "magnet:") && !strings.HasPrefix(url, "ed2k:")) {
+	   strings.Contains(url, "#") ||
+	   url == "" ||
+	   (!strings.HasPrefix(url, "http") && !strings.HasPrefix(url, "magnet:") && !strings.HasPrefix(url, "ed2k:")) {
 		return false
 	}
 	return true
 }
+
 
 // determineLinkType 根据URL确定链接类型
 func (p *ErxiaoAsyncPlugin) determineLinkType(url string) string {
@@ -542,9 +492,6 @@ func (p *ErxiaoAsyncPlugin) doRequestWithRetry(req *http.Request, client *http.C
 			lastErr = fmt.Errorf("HTTP状态码: %d", resp.StatusCode)
 		} else {
 			lastErr = err
-		}
-		if req.Context().Err() != nil {
-			return nil, req.Context().Err()
 		}
 
 		// 快速重试：只等待很短时间

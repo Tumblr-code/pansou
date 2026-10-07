@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
-	"pansou/util"
 	"regexp"
 	"strconv"
 	"strings"
@@ -183,7 +182,7 @@ func (p *QupanshePlugin) getFormhash(client *http.Client) (string, error) {
 			return "", fmt.Errorf("创建gzip读取器失败: %w", err)
 		}
 		defer gzipReader.Close()
-		reader = util.NewCappedReader(gzipReader, util.MaxDecompressedBytes)
+		reader = gzipReader
 	}
 
 	// 解析HTML
@@ -249,7 +248,7 @@ func (p *QupanshePlugin) postSearchRequest(client *http.Client, keyword, formhas
 				fmt.Printf("  %s: %s\n", key, value)
 			}
 		}
-
+		
 		// 显示将要发送的cookies
 		if client.Jar != nil {
 			if u, _ := url.Parse(searchURL); u != nil {
@@ -288,7 +287,7 @@ func (p *QupanshePlugin) postSearchRequest(client *http.Client, keyword, formhas
 
 	// 读取响应体用于调试（非重定向状态码时）
 	if resp.StatusCode != 302 && resp.StatusCode != 301 && DebugLog {
-		body, readErr := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
+		body, readErr := io.ReadAll(resp.Body)
 		if readErr == nil {
 			bodyStr := string(body)
 			if len(bodyStr) > 1000 {
@@ -346,7 +345,7 @@ func (p *QupanshePlugin) getSearchResults(client *http.Client, searchURL, keywor
 			return nil, fmt.Errorf("创建gzip读取器失败: %w", err)
 		}
 		defer gzipReader.Close()
-		reader = util.NewCappedReader(gzipReader, util.MaxDecompressedBytes)
+		reader = gzipReader
 	}
 
 	// 解析HTML
@@ -509,7 +508,7 @@ func (p *QupanshePlugin) parseSearchResult(s *goquery.Selection) model.SearchRes
 // cleanTitle 清理标题中的HTML标签
 func (p *QupanshePlugin) cleanTitle(titleHTML string) string {
 	// 移除所有HTML标签
-	re := qupansheRe1
+	re := regexp.MustCompile(`<[^>]*>`)
 	title := re.ReplaceAllString(titleHTML, "")
 
 	// 清理HTML实体
@@ -719,7 +718,7 @@ func (p *QupanshePlugin) extractPasswordFromURL(rawURL string) (normalizedURL st
 // parseStats 解析统计信息
 func (p *QupanshePlugin) parseStats(statsText string, replyCount, viewCount *int) {
 	// 解析如 "18 个回复 - 5926 次查看" 格式
-	re := qupansheRe2
+	re := regexp.MustCompile(`(\d+)\s*个回复\s*-\s*(\d+)\s*次查看`)
 	matches := re.FindStringSubmatch(statsText)
 	if len(matches) >= 3 {
 		if reply, err := strconv.Atoi(matches[1]); err == nil {
@@ -806,10 +805,3 @@ func init() {
 	p := NewQupanshePlugin()
 	plugin.RegisterGlobalPlugin(p)
 }
-
-// 以下正则原先在函数内临时编译，每次调用都要重新解析模式；
-// 提到包级后只编译一次，匹配行为不变。
-var (
-	qupansheRe1 = regexp.MustCompile(`<[^>]*>`)
-	qupansheRe2 = regexp.MustCompile(`(\d+)\s*个回复\s*-\s*(\d+)\s*次查看`)
-)

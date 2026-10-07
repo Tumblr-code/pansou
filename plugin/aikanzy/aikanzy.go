@@ -7,7 +7,6 @@ import (
 	"net/url"
 	"pansou/model"
 	"pansou/plugin"
-	"pansou/util"
 	"regexp"
 	"strings"
 	"sync"
@@ -20,19 +19,19 @@ import (
 var (
 	// 夸克网盘链接
 	quarkLinkRegex = regexp.MustCompile(`https?://pan\.quark\.cn/s/[0-9a-zA-Z]+`)
-
+	
 	// UC网盘链接
 	ucLinkRegex = regexp.MustCompile(`https?://drive\.uc\.cn/s/[0-9a-zA-Z]+(\?[^"'\s]*)?`)
-
+	
 	// 百度网盘链接
 	baiduLinkRegex = regexp.MustCompile(`https?://pan\.baidu\.com/s/[0-9a-zA-Z_-]+`)
-
+	
 	// 迅雷网盘链接
 	xunleiLinkRegex = regexp.MustCompile(`https?://pan\.xunlei\.com/s/[0-9a-zA-Z_-]+`)
-
+	
 	// 从URL中提取文章ID
 	articleIDRegex = regexp.MustCompile(`/([a-z]+)/(\d+)\.html`)
-
+	
 	// 提取阅读数
 	viewCountRegex = regexp.MustCompile(`(\d+)\s*阅读`)
 )
@@ -41,25 +40,25 @@ var (
 const (
 	// 插件名称
 	pluginName = "aikanzy"
-
+	
 	// 搜索URL模板
 	searchURLTemplate = "https://www.aikanzy.com/search?word=%s&molds=article"
-
+	
 	// 默认优先级
 	defaultPriority = 3
-
+	
 	// 默认超时时间（秒）
 	defaultTimeout = 15
-
+	
 	// 详情页超时时间（秒）
 	detailTimeout = 8
-
+	
 	// 最大重试次数
 	maxRetries = 3
-
+	
 	// 详情页并发数
 	detailConcurrency = 15
-
+	
 	// 指数退避基数（毫秒）
 	backoffBase = 200
 )
@@ -81,7 +80,6 @@ func init() {
 // createOptimizedHTTPClient 创建优化的HTTP客户端
 func createOptimizedHTTPClient() *http.Client {
 	transport := &http.Transport{
-		Proxy:               util.ProxyFuncForTransport(),
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
 		IdleConnTimeout:     90 * time.Second,
@@ -132,23 +130,23 @@ func (p *AikanzyAsyncPlugin) doSearch(client *http.Client, keyword string, ext m
 	if p.optimizedClient != nil {
 		client = p.optimizedClient
 	}
-
+	
 	// 对关键词进行URL编码
 	encodedKeyword := url.QueryEscape(keyword)
-
+	
 	// 构建搜索URL
 	searchURL := fmt.Sprintf(searchURLTemplate, encodedKeyword)
-
+	
 	// 创建一个带有超时的上下文
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout*time.Second)
 	defer cancel()
-
+	
 	// 创建请求
 	req, err := http.NewRequestWithContext(ctx, "GET", searchURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("[%s] 创建请求失败: %w", p.Name(), err)
 	}
-
+	
 	// 设置完整的请求头（避免反爬虫）
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
@@ -157,37 +155,37 @@ func (p *AikanzyAsyncPlugin) doSearch(client *http.Client, keyword string, ext m
 	req.Header.Set("Referer", "https://www.aikanzy.com/")
 	req.Header.Set("Upgrade-Insecure-Requests", "1")
 	req.Header.Set("Cache-Control", "max-age=0")
-
+	
 	// 使用带重试的请求方法发送HTTP请求
 	resp, err := p.doRequestWithRetry(req, client)
 	if err != nil {
 		return nil, fmt.Errorf("[%s] 请求搜索页面失败: %w", p.Name(), err)
 	}
 	defer resp.Body.Close()
-
+	
 	// 检查状态码
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("[%s] 请求搜索页面失败，状态码: %d", p.Name(), resp.StatusCode)
 	}
-
+	
 	// 使用goquery解析HTML
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("[%s] 解析HTML失败: %w", p.Name(), err)
 	}
-
+	
 	// 解析搜索结果列表
 	articleItems := p.parseArticleList(doc)
 	if len(articleItems) == 0 {
 		return []model.SearchResult{}, nil
 	}
-
+	
 	// 并发抓取详情页获取网盘链接
 	results := p.fetchDetailsWithLinks(articleItems, client, keyword)
-
+	
 	// 使用过滤功能过滤结果
 	filteredResults := plugin.FilterResultsByKeyword(results, keyword)
-
+	
 	return filteredResults, nil
 }
 
@@ -206,7 +204,7 @@ type ArticleItem struct {
 // parseArticleList 解析文章列表
 func (p *AikanzyAsyncPlugin) parseArticleList(doc *goquery.Document) []ArticleItem {
 	var items []ArticleItem
-
+	
 	// 查找所有文章项
 	doc.Find("article.post-list.contt.blockimg").Each(func(i int, s *goquery.Selection) {
 		// 提取详情页链接
@@ -215,13 +213,13 @@ func (p *AikanzyAsyncPlugin) parseArticleList(doc *goquery.Document) []ArticleIt
 		if !exists || detailURL == "" {
 			return
 		}
-
+		
 		// 提取文章ID
 		articleID := p.extractArticleID(detailURL)
 		if articleID == "" {
 			return
 		}
-
+		
 		// 提取标题
 		title := strings.TrimSpace(s.Find("header.entry-header span.entry-title a").Text())
 		// 移除标题中的HTML标签（如<b>）
@@ -229,24 +227,24 @@ func (p *AikanzyAsyncPlugin) parseArticleList(doc *goquery.Document) []ArticleIt
 		if title == "" {
 			return
 		}
-
+		
 		// 提取分类
 		category := strings.TrimSpace(s.Find("div.entry-meta > a").First().Text())
-
+		
 		// 提取发布日期
 		publishDate := strings.TrimSpace(s.Find("time").First().Text())
-
+		
 		// 提取阅读数
 		metaText := s.Find("div.entry-meta").Text()
 		viewCount := p.extractViewCount(metaText)
-
+		
 		// 提取摘要
 		summary := strings.TrimSpace(s.Find("div.entry-summary.ss p").Text())
 		summary = p.cleanHTMLTags(summary)
-
+		
 		// 提取缩略图
 		imageURL, _ := s.Find("img.block-fea").Attr("data-src")
-
+		
 		items = append(items, ArticleItem{
 			ID:          articleID,
 			Title:       title,
@@ -258,7 +256,7 @@ func (p *AikanzyAsyncPlugin) parseArticleList(doc *goquery.Document) []ArticleIt
 			ImageURL:    imageURL,
 		})
 	})
-
+	
 	return items
 }
 
@@ -267,29 +265,29 @@ func (p *AikanzyAsyncPlugin) fetchDetailsWithLinks(items []ArticleItem, client *
 	// 创建结果通道和等待组
 	resultChan := make(chan model.SearchResult, len(items))
 	var wg sync.WaitGroup
-
+	
 	// 创建信号量控制并发数
 	semaphore := make(chan struct{}, detailConcurrency)
-
+	
 	// 并发处理每个文章项
 	for _, item := range items {
 		wg.Add(1)
-
+		
 		go func(item ArticleItem) {
 			defer wg.Done()
-
+			
 			// 获取信号量
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
-
+			
 			// 抓取详情页
 			links := p.fetchDetailPageLinks(item.DetailURL, client)
-
+			
 			// 只有包含链接的结果才添加
 			if len(links) > 0 {
 				// 解析发布时间
 				publishTime := p.parsePublishTime(item.PublishDate)
-
+				
 				// 组装内容
 				var contentParts []string
 				if item.Summary != "" {
@@ -305,13 +303,13 @@ func (p *AikanzyAsyncPlugin) fetchDetailsWithLinks(items []ArticleItem, client *
 					contentParts = append(contentParts, fmt.Sprintf("%d阅读", item.ViewCount))
 				}
 				content := strings.Join(contentParts, " | ")
-
+				
 				// 组装标签
 				var tags []string
 				if item.Category != "" {
 					tags = append(tags, item.Category)
 				}
-
+				
 				result := model.SearchResult{
 					UniqueID: fmt.Sprintf("aikanzy-%s", item.ID),
 					Title:    item.Title,
@@ -321,24 +319,24 @@ func (p *AikanzyAsyncPlugin) fetchDetailsWithLinks(items []ArticleItem, client *
 					Channel:  "", // 插件搜索结果Channel为空
 					Datetime: publishTime,
 				}
-
+				
 				resultChan <- result
 			}
 		}(item)
 	}
-
+	
 	// 等待所有goroutine完成
 	go func() {
 		wg.Wait()
 		close(resultChan)
 	}()
-
+	
 	// 收集所有结果
 	var results []model.SearchResult
 	for result := range resultChan {
 		results = append(results, result)
 	}
-
+	
 	return results
 }
 
@@ -347,13 +345,13 @@ func (p *AikanzyAsyncPlugin) fetchDetailPageLinks(detailURL string, client *http
 	// 创建带超时的上下文
 	ctx, cancel := context.WithTimeout(context.Background(), detailTimeout*time.Second)
 	defer cancel()
-
+	
 	// 创建请求
 	req, err := http.NewRequestWithContext(ctx, "GET", detailURL, nil)
 	if err != nil {
 		return nil
 	}
-
+	
 	// 设置请求头
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
@@ -361,25 +359,25 @@ func (p *AikanzyAsyncPlugin) fetchDetailPageLinks(detailURL string, client *http
 	req.Header.Set("Connection", "keep-alive")
 	req.Header.Set("Referer", "https://www.aikanzy.com/")
 	req.Header.Set("Upgrade-Insecure-Requests", "1")
-
+	
 	// 发送请求（带重试）
 	resp, err := p.doRequestWithRetry(req, client)
 	if err != nil {
 		return nil
 	}
 	defer resp.Body.Close()
-
+	
 	// 检查状态码
 	if resp.StatusCode != http.StatusOK {
 		return nil
 	}
-
+	
 	// 解析HTML
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
 	if err != nil {
 		return nil
 	}
-
+	
 	// 提取网盘链接
 	return p.extractNetDiskLinks(doc)
 }
@@ -388,37 +386,37 @@ func (p *AikanzyAsyncPlugin) fetchDetailPageLinks(detailURL string, client *http
 func (p *AikanzyAsyncPlugin) extractNetDiskLinks(doc *goquery.Document) []model.Link {
 	var links []model.Link
 	foundURLs := make(map[string]bool) // 用于去重
-
+	
 	// 方法1: 从<a>标签的href属性提取
 	doc.Find("a[href*='pan.quark.cn'], a[href*='drive.uc.cn'], a[href*='pan.baidu.com'], a[href*='pan.xunlei.com']").Each(func(i int, s *goquery.Selection) {
 		href, exists := s.Attr("href")
 		if !exists || href == "" {
 			return
 		}
-
+		
 		// 去重
 		if foundURLs[href] {
 			return
 		}
 		foundURLs[href] = true
-
+		
 		// 确定链接类型
 		linkType := p.determineLinkType(href)
 		if linkType == "" {
 			return
 		}
-
+		
 		links = append(links, model.Link{
 			Type:     linkType,
 			URL:      href,
 			Password: p.extractPassword(href),
 		})
 	})
-
+	
 	// 方法2: 从页面HTML文本中提取（正则表达式）
 	if len(links) == 0 {
 		html, _ := doc.Html()
-
+		
 		// 提取夸克网盘链接
 		quarkLinks := quarkLinkRegex.FindAllString(html, -1)
 		for _, link := range quarkLinks {
@@ -431,7 +429,7 @@ func (p *AikanzyAsyncPlugin) extractNetDiskLinks(doc *goquery.Document) []model.
 				})
 			}
 		}
-
+		
 		// 提取UC网盘链接
 		ucLinks := ucLinkRegex.FindAllString(html, -1)
 		for _, link := range ucLinks {
@@ -444,7 +442,7 @@ func (p *AikanzyAsyncPlugin) extractNetDiskLinks(doc *goquery.Document) []model.
 				})
 			}
 		}
-
+		
 		// 提取百度网盘链接
 		baiduLinks := baiduLinkRegex.FindAllString(html, -1)
 		for _, link := range baiduLinks {
@@ -457,7 +455,7 @@ func (p *AikanzyAsyncPlugin) extractNetDiskLinks(doc *goquery.Document) []model.
 				})
 			}
 		}
-
+		
 		// 提取迅雷网盘链接
 		xunleiLinks := xunleiLinkRegex.FindAllString(html, -1)
 		for _, link := range xunleiLinks {
@@ -471,14 +469,14 @@ func (p *AikanzyAsyncPlugin) extractNetDiskLinks(doc *goquery.Document) []model.
 			}
 		}
 	}
-
+	
 	return links
 }
 
 // determineLinkType 根据URL确定链接类型
 func (p *AikanzyAsyncPlugin) determineLinkType(urlStr string) string {
 	lowerURL := strings.ToLower(urlStr)
-
+	
 	switch {
 	case strings.Contains(lowerURL, "pan.quark.cn"):
 		return "quark"
@@ -516,12 +514,12 @@ func (p *AikanzyAsyncPlugin) extractViewCount(text string) int {
 // cleanHTMLTags 清除HTML标签
 func (p *AikanzyAsyncPlugin) cleanHTMLTags(text string) string {
 	// 移除<b>标签
-	text = aikanzyRe1.ReplaceAllString(text, "")
-	text = aikanzyRe2.ReplaceAllString(text, "")
-
+	text = regexp.MustCompile(`<b[^>]*>`).ReplaceAllString(text, "")
+	text = regexp.MustCompile(`</b>`).ReplaceAllString(text, "")
+	
 	// 移除其他常见HTML标签
-	text = aikanzyRe3.ReplaceAllString(text, "")
-
+	text = regexp.MustCompile(`<[^>]+>`).ReplaceAllString(text, "")
+	
 	return strings.TrimSpace(text)
 }
 
@@ -531,7 +529,7 @@ func (p *AikanzyAsyncPlugin) parsePublishTime(dateStr string) time.Time {
 	if dateStr == "" {
 		return time.Time{}
 	}
-
+	
 	// 尝试多种日期格式
 	formats := []string{
 		"2006-01-02",
@@ -540,25 +538,25 @@ func (p *AikanzyAsyncPlugin) parsePublishTime(dateStr string) time.Time {
 		"2006-01-02T15:04:05+08:00",
 		"2006-01-02T15:04:05-07:00",
 	}
-
+	
 	for _, format := range formats {
 		if t, err := time.Parse(format, dateStr); err == nil {
 			return t
 		}
 	}
-
+	
 	// 如果以上格式都不匹配，尝试使用time.RFC3339格式（处理<time>标签的datetime属性）
 	if t, err := time.Parse(time.RFC3339, dateStr); err == nil {
 		return t
 	}
-
+	
 	return time.Time{}
 }
 
 // extractPassword 从网盘链接中提取密码
 func (p *AikanzyAsyncPlugin) extractPassword(urlStr string) string {
 	// 从URL中提取pwd=后面的四位密码(不包含#)
-	pwdRegex := aikanzyRe4
+	pwdRegex := regexp.MustCompile(`pwd=([^#&]{4})`)
 	matches := pwdRegex.FindStringSubmatch(urlStr)
 	if len(matches) >= 2 {
 		return matches[1]
@@ -569,43 +567,27 @@ func (p *AikanzyAsyncPlugin) extractPassword(urlStr string) string {
 // doRequestWithRetry 发送HTTP请求，带重试机制
 func (p *AikanzyAsyncPlugin) doRequestWithRetry(req *http.Request, client *http.Client) (*http.Response, error) {
 	var resp *http.Response
-
-	// 重试逻辑收敛到 util.DoWithRetry。原实现是"先等待再发请求"，与组件的"失败后等待"
-	// 等价：原第 k 次尝试前等 backoffBase×2^(k-1)ms，组件在第 j 次失败后等
-	// backoffBase×2^j ms 再发第 j+1 次，逐项相同。次数保持 maxRetries+1。
-	//
-	// 顺带修掉一个诊断缺陷：原先只把 client.Do 的 err 存起来，非 200 状态码时 err 为 nil，
-	// 于是重试耗尽后报出的是 "重试 N 次后仍然失败: %!w(<nil>)"，真实状态码丢失、
-	// 完全无法定位。现在把状态码带出来。
-	err := util.DoWithRetry(util.RetryConfig{
-		Attempts:   maxRetries + 1,
-		BaseDelay:  backoffBase * time.Millisecond,
-		Multiplier: 2,
-	}, func(_ int) error {
-		// 原实现每次重试都克隆请求，这里保持同样意图
-		r, err := client.Do(req.Clone(req.Context()))
-		if err != nil {
-			return err
+	var err error
+	
+	for retry := 0; retry <= maxRetries; retry++ {
+		if retry > 0 {
+			// 指数退避
+			backoffTime := time.Duration(1<<uint(retry-1)) * backoffBase * time.Millisecond
+			time.Sleep(backoffTime)
+			
+			// 克隆请求
+			req = req.Clone(req.Context())
 		}
-		if r.StatusCode == http.StatusOK {
-			resp = r
-			return nil
+		
+		resp, err = client.Do(req)
+		if err == nil && resp.StatusCode == 200 {
+			return resp, nil
 		}
-		status := r.StatusCode
-		r.Body.Close()
-		return fmt.Errorf("HTTP 状态码 %d", status)
-	})
-	if err != nil {
-		return nil, err
+		
+		if resp != nil {
+			resp.Body.Close()
+		}
 	}
-	return resp, nil
+	
+	return nil, fmt.Errorf("重试 %d 次后仍然失败: %w", maxRetries, err)
 }
-
-// 以下正则原先在函数内临时编译，每次调用都要重新解析模式；
-// 提到包级后只编译一次，匹配行为不变。
-var (
-	aikanzyRe1 = regexp.MustCompile(`<b[^>]*>`)
-	aikanzyRe2 = regexp.MustCompile(`</b>`)
-	aikanzyRe3 = regexp.MustCompile(`<[^>]+>`)
-	aikanzyRe4 = regexp.MustCompile(`pwd=([^#&]{4})`)
-)

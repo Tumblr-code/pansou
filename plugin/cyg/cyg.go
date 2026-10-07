@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 	"html"
+	"io"
 	"net/http"
 	"net/url"
-	"pansou/util"
 	"regexp"
 	"strings"
 	"sync"
@@ -20,18 +20,18 @@ import (
 // 预编译的正则表达式（性能优化）
 var (
 	// 常见网盘链接的正则表达式（支持15+种类型）
-	quarkLinkRegex  = regexp.MustCompile(`https?://pan\.quark\.cn/s/[0-9a-zA-Z]+`)
-	ucLinkRegex     = regexp.MustCompile(`https?://drive\.uc\.cn/s/[0-9a-zA-Z]+`)
-	baiduLinkRegex  = regexp.MustCompile(`https?://pan\.baidu\.com/s/[0-9a-zA-Z_\-]+`)
-	aliyunLinkRegex = regexp.MustCompile(`https?://(www\.)?(aliyundrive\.com|alipan\.com)/s/[0-9a-zA-Z]+`)
-	xunleiLinkRegex = regexp.MustCompile(`https?://pan\.xunlei\.com/s/[0-9a-zA-Z_\-]+`)
-	tianyiLinkRegex = regexp.MustCompile(`https?://cloud\.189\.cn/t/[0-9a-zA-Z]+`)
-	link115Regex    = regexp.MustCompile(`https?://115\.com/s/[0-9a-zA-Z]+`)
-	mobileLinkRegex = regexp.MustCompile(`https?://(caiyun\.feixin\.10086\.cn|caiyun\.139\.com|yun\.139\.com|cloud\.139\.com|pan\.139\.com)/.*`)
-	link123Regex    = regexp.MustCompile(`https?://123pan\.com/s/[0-9a-zA-Z]+`)
-	pikpakLinkRegex = regexp.MustCompile(`https?://mypikpak\.com/s/[0-9a-zA-Z]+`)
-	magnetLinkRegex = regexp.MustCompile(`magnet:\?xt=urn:btih:[0-9a-fA-F]{40}`)
-	ed2kLinkRegex   = regexp.MustCompile(`ed2k://\|file\|.+\|\d+\|[0-9a-fA-F]{32}\|/`)
+	quarkLinkRegex      = regexp.MustCompile(`https?://pan\.quark\.cn/s/[0-9a-zA-Z]+`)
+	ucLinkRegex         = regexp.MustCompile(`https?://drive\.uc\.cn/s/[0-9a-zA-Z]+`)
+	baiduLinkRegex      = regexp.MustCompile(`https?://pan\.baidu\.com/s/[0-9a-zA-Z_\-]+`)
+	aliyunLinkRegex     = regexp.MustCompile(`https?://(www\.)?(aliyundrive\.com|alipan\.com)/s/[0-9a-zA-Z]+`)
+	xunleiLinkRegex     = regexp.MustCompile(`https?://pan\.xunlei\.com/s/[0-9a-zA-Z_\-]+`)
+	tianyiLinkRegex     = regexp.MustCompile(`https?://cloud\.189\.cn/t/[0-9a-zA-Z]+`)
+	link115Regex        = regexp.MustCompile(`https?://115\.com/s/[0-9a-zA-Z]+`)
+	mobileLinkRegex     = regexp.MustCompile(`https?://(caiyun\.feixin\.10086\.cn|caiyun\.139\.com|yun\.139\.com|cloud\.139\.com|pan\.139\.com)/.*`)
+	link123Regex        = regexp.MustCompile(`https?://123pan\.com/s/[0-9a-zA-Z]+`)
+	pikpakLinkRegex     = regexp.MustCompile(`https?://mypikpak\.com/s/[0-9a-zA-Z]+`)
+	magnetLinkRegex     = regexp.MustCompile(`magnet:\?xt=urn:btih:[0-9a-fA-F]{40}`)
+	ed2kLinkRegex       = regexp.MustCompile(`ed2k://\|file\|.+\|\d+\|[0-9a-fA-F]{32}\|/`)
 
 	// HTML标签清理
 	htmlTagRegex = regexp.MustCompile(`<[^>]*>`)
@@ -42,13 +42,11 @@ type CygPlugin struct {
 	*plugin.BaseAsyncPlugin
 }
 
-const cygBaseURL = "https://www.acgndog.com"
-
 // CygPost 搜索结果结构体
 type CygPost struct {
-	ID    int    `json:"id"`
-	Date  string `json:"date"`
-	Title struct {
+	ID       int    `json:"id"`
+	Date     string `json:"date"`
+	Title    struct {
 		Rendered string `json:"rendered"`
 	} `json:"title"`
 	Excerpt struct {
@@ -106,7 +104,7 @@ func (p *CygPlugin) searchImpl(client *http.Client, keyword string, ext map[stri
 	opts := p.parseExtOptions(ext)
 
 	// 1. 构建搜索URL
-	searchURL := fmt.Sprintf(cygBaseURL+"/wp-json/wp/v2/posts?per_page=%d&orderby=%s&order=%s&page=%d&search=%s",
+	searchURL := fmt.Sprintf("https://cyg.app/wp-json/wp/v2/posts?per_page=%d&orderby=%s&order=%s&page=%d&search=%s",
 		opts.PerPage, opts.OrderBy, opts.Order, opts.Page, url.QueryEscape(keyword))
 
 	// 2. 发送搜索请求
@@ -156,7 +154,7 @@ func (p *CygPlugin) fetchSearchResults(client *http.Client, searchURL string) ([
 	}
 
 	// 解析响应
-	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("读取响应失败: %w", err)
 	}
@@ -219,7 +217,7 @@ func (p *CygPlugin) fetchDownloadLinksAsync(client *http.Client, posts []CygPost
 // getDownloadLinks 获取指定帖子的下载链接
 func (p *CygPlugin) getDownloadLinks(client *http.Client, postID int) ([]model.Link, error) {
 	// 构建下载链接获取URL
-	downloadURL := fmt.Sprintf(cygBaseURL+"/wp-json/acg-studio/v1/download?id=%d", postID)
+	downloadURL := fmt.Sprintf("https://cyg.app/wp-json/acg-studio/v1/download?id=%d", postID)
 
 	// 创建带超时的上下文
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -247,7 +245,7 @@ func (p *CygPlugin) getDownloadLinks(client *http.Client, postID int) ([]model.L
 	}
 
 	// 解析响应
-	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("读取下载链接响应失败: %w", err)
 	}
@@ -264,13 +262,13 @@ func (p *CygPlugin) getDownloadLinks(client *http.Client, postID int) ([]model.L
 // convertToSearchResult 转换为标准搜索结果格式
 func (p *CygPlugin) convertToSearchResult(post CygPost, links []model.Link) model.SearchResult {
 	return model.SearchResult{
-		UniqueID: fmt.Sprintf("cyg-%d", post.ID),
-		Title:    p.cleanHTML(post.Title.Rendered),
-		Content:  p.cleanHTML(post.Excerpt.Rendered),
-		Datetime: p.parseDateTime(post.Date),
-		Tags:     []string{post.CategoryName},
-		Links:    links,
-		Channel:  "", // 插件搜索结果必须为空字符串
+		UniqueID:  fmt.Sprintf("cyg-%d", post.ID),
+		Title:     p.cleanHTML(post.Title.Rendered),
+		Content:   p.cleanHTML(post.Excerpt.Rendered),
+		Datetime:  p.parseDateTime(post.Date),
+		Tags:      []string{post.CategoryName},
+		Links:     links,
+		Channel:   "", // 插件搜索结果必须为空字符串
 	}
 }
 
@@ -360,7 +358,7 @@ func (p *CygPlugin) determineCloudType(name string) string {
 
 // setRequestHeaders 设置请求头
 func (p *CygPlugin) setRequestHeaders(req *http.Request) {
-	req.Header.Set("Referer", cygBaseURL+"/")
+	req.Header.Set("Referer", "https://h5.acgn.my/")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
@@ -388,19 +386,9 @@ func (p *CygPlugin) doRequestWithRetry(req *http.Request, client *http.Client) (
 		}
 
 		if resp != nil {
-			status := resp.StatusCode
 			resp.Body.Close()
-			if err == nil {
-				// Do 成功但状态码非 200。此前这里只执行 lastErr = err，
-				// err 为 nil 时会把 lastErr 清空，三次失败后仅报出
-				// "%!w(<nil>)"，真实状态码被丢掉、无法定位失败原因。
-				err = fmt.Errorf("HTTP 状态码 %d", status)
-			}
 		}
 		lastErr = err
-		if err == nil {
-			lastErr = fmt.Errorf("HTTP 状态码 %d", resp.StatusCode)
-		}
 	}
 
 	return nil, fmt.Errorf("重试 %d 次后仍然失败: %w", maxRetries, lastErr)
@@ -450,7 +438,7 @@ func (p *CygPlugin) cleanHTML(htmlContent string) string {
 	text = strings.TrimSpace(text)
 
 	// 替换多个空白字符为单个空格
-	text = cygRe1.ReplaceAllString(text, " ")
+	text = regexp.MustCompile(`\s+`).ReplaceAllString(text, " ")
 
 	return text
 }
@@ -478,9 +466,3 @@ func (p *CygPlugin) parseDateTime(dateStr string) time.Time {
 	// 解析失败时返回当前时间
 	return time.Now()
 }
-
-// 以下正则原先在函数内临时编译，每次调用都要重新解析模式；
-// 提到包级后只编译一次，匹配行为不变。
-var (
-	cygRe1 = regexp.MustCompile(`\s+`)
-)

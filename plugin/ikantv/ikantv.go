@@ -3,9 +3,9 @@ package ikantv
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
-	"pansou/util"
 	"strings"
 	"time"
 
@@ -90,7 +90,7 @@ func (p *IkanTVAsyncPlugin) doSearch(client *http.Client, keyword string, ext ma
 		return nil, fmt.Errorf("[%s] 请求返回状态码: %d", p.Name(), resp.StatusCode)
 	}
 
-	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("[%s] 读取响应失败: %w", p.Name(), err)
 	}
@@ -214,14 +214,7 @@ func (p *IkanTVAsyncPlugin) doRequestWithRetry(req *http.Request, client *http.C
 		}
 
 		if resp != nil {
-			status := resp.StatusCode
 			resp.Body.Close()
-			if err == nil {
-				// Do 成功但状态码非 200。此前这里只执行 lastErr = err，
-				// err 为 nil 时会把 lastErr 清空，三次失败后仅报出
-				// "%!w(<nil>)"，真实状态码被丢掉、无法定位失败原因。
-				err = fmt.Errorf("HTTP 状态码 %d", status)
-			}
 		}
 		lastErr = err
 		if lastErr == nil {

@@ -14,7 +14,6 @@ import (
 
 	"pansou/model"
 	"pansou/plugin"
-	"pansou/util"
 )
 
 var (
@@ -90,7 +89,6 @@ func (p *KkMaoPlugin) SearchWithResult(keyword string, ext map[string]interface{
 
 func newHTTPClient() *http.Client {
 	transport := &http.Transport{
-		Proxy:                 util.ProxyFuncForTransport(),
 		MaxIdleConns:          maxIdleConns,
 		MaxIdleConnsPerHost:   maxIdlePerHost,
 		MaxConnsPerHost:       maxConnsPerHost,
@@ -362,33 +360,24 @@ func setCommonHeaders(req *http.Request, referer string) {
 }
 
 func (p *KkMaoPlugin) doRequestWithRetry(req *http.Request, client *http.Client, maxRetries int, baseDelay time.Duration) (*http.Response, error) {
-	var resp *http.Response
+	var lastErr error
 
-	// 重试逻辑收敛到 util.DoWithRetry：这段循环在多个插件里逐字复制过。
-	// 指数退避（baseDelay x 2^attempt）与"最后一次不再等待"的语义保持不变。
-	err := util.DoWithRetry(util.RetryConfig{
-		Attempts:   maxRetries,
-		BaseDelay:  baseDelay,
-		Multiplier: 2,
-	}, func(_ int) error {
-		r, err := client.Do(req.Clone(req.Context()))
-		if err != nil {
-			return err
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		resp, err := client.Do(req.Clone(req.Context()))
+		if err == nil && resp.StatusCode == http.StatusOK {
+			return resp, nil
 		}
-		if r.StatusCode == http.StatusOK {
-			resp = r
-			return nil
+		if resp != nil {
+			resp.Body.Close()
 		}
-		status := r.StatusCode
-		r.Body.Close()
-		// Do 成功但状态码非 200：必须把状态码带出来。此前这里只赋值 err，
-		// err 为 nil 时会清空失败原因，几次失败后仅报出 "%!w(<nil>)"。
-		return fmt.Errorf("HTTP 状态码 %d", status)
-	})
-	if err != nil {
-		return nil, err
+		lastErr = err
+		if attempt < maxRetries-1 {
+			backoff := baseDelay * time.Duration(1<<attempt)
+			time.Sleep(backoff)
+		}
 	}
-	return resp, nil
+
+	return nil, fmt.Errorf("重试 %d 次后失败: %w", maxRetries, lastErr)
 }
 
 func startDetailCacheCleaner() {

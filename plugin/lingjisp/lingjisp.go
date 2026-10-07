@@ -12,7 +12,6 @@ import (
 
 	"pansou/model"
 	"pansou/plugin"
-	"pansou/util"
 	"pansou/util/json"
 )
 
@@ -99,7 +98,6 @@ func NewLingjiPlugin() *LingjiPlugin {
 		client: &http.Client{
 			Timeout: lingjiSearchTimeout,
 			Transport: &http.Transport{
-				Proxy:               util.ProxyFuncForTransport(),
 				MaxIdleConns:        64,
 				MaxIdleConnsPerHost: 16,
 				MaxConnsPerHost:     24,
@@ -234,24 +232,14 @@ func (p *LingjiPlugin) fetchDetail(client *http.Client, doubID int) (lingjiVideo
 }
 
 func doLingjiGET(client *http.Client, requestURL string, timeout time.Duration) ([]byte, error) {
-	var body []byte
+	var lastErr error
 
-	// 重试逻辑收敛到 util.DoWithRetry。两处语义要点：
-	// 1) 原实现每次尝试各自 context.WithTimeout，超时按次计算而非整轮共享——ctx/cancel
-	//    建在闭包内（defer cancel 随闭包返回释放，不跨轮累积）；
-	// 2) 原先读响应体是手写的 for {} + 无限 append，**没有任何上限**，上游给多大就吃多大。
-	//    改用 util.ReadAllLimited 统一封顶。
-	err := util.DoWithRetry(util.RetryConfig{
-		Attempts:   lingjiMaxRetries,
-		BaseDelay:  200 * time.Millisecond,
-		Multiplier: 2,
-	}, func(_ int) error {
+	for attempt := 0; attempt < lingjiMaxRetries; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 		if err != nil {
-			return err
+			cancel()
+			return nil, err
 		}
 
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
@@ -259,27 +247,43 @@ func doLingjiGET(client *http.Client, requestURL string, timeout time.Duration) 
 		req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
 		req.Header.Set("Connection", "keep-alive")
 		req.Header.Set("Referer", lingjiAPIBase)
+
 		resp, err := client.Do(req)
-		if err != nil {
-			return err
+		if err == nil && resp.StatusCode == http.StatusOK {
+			defer resp.Body.Close()
+			data := make([]byte, 0)
+			buffer := make([]byte, 32*1024)
+			for {
+				n, readErr := resp.Body.Read(buffer)
+				if n > 0 {
+					data = append(data, buffer[:n]...)
+				}
+				if readErr != nil {
+					if strings.Contains(readErr.Error(), "EOF") {
+						cancel()
+						return data, nil
+					}
+					lastErr = readErr
+					break
+				}
+			}
+		} else {
+			if resp != nil {
+				resp.Body.Close()
+			}
+			lastErr = err
+			if lastErr == nil {
+				lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			}
 		}
-		if resp.StatusCode != http.StatusOK {
-			status := resp.StatusCode
-			resp.Body.Close()
-			return fmt.Errorf("HTTP %d", status)
+		cancel()
+
+		if attempt < lingjiMaxRetries-1 {
+			time.Sleep(200 * time.Millisecond * time.Duration(1<<attempt))
 		}
-		data, readErr := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
-		resp.Body.Close()
-		if readErr != nil {
-			return readErr
-		}
-		body = data
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
-	return body, nil
+
+	return nil, fmt.Errorf("重试 %d 次后失败: %w", lingjiMaxRetries, lastErr)
 }
 
 func dedupeLingjiItems(items []lingjiVideoItem) []lingjiVideoItem {
@@ -449,7 +453,7 @@ func cleanLingjiText(text string) string {
 	text = strings.ReplaceAll(text, "\u00a0", " ")
 	text = strings.ReplaceAll(text, "\n", " ")
 	text = strings.ReplaceAll(text, "\r", " ")
-	return strings.TrimSpace(lingjispRe1.ReplaceAllString(text, " "))
+	return strings.TrimSpace(regexp.MustCompile(`\s+`).ReplaceAllString(text, " "))
 }
 
 func parseLingjiTime(candidates ...string) time.Time {
@@ -473,9 +477,3 @@ func parseLingjiTime(candidates ...string) time.Time {
 
 	return time.Now()
 }
-
-// 以下正则原先在函数内临时编译，每次调用都要重新解析模式；
-// 提到包级后只编译一次，匹配行为不变。
-var (
-	lingjispRe1 = regexp.MustCompile(`\s+`)
-)

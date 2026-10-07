@@ -1,0 +1,53 @@
+name: Release
+on:
+  release:
+    types: [published]
+permissions:
+  contents: write
+  packages: write
+jobs:
+  release:
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.9'
+          cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify and package the final tag
+        run: |
+          python scripts/verify_production_source.py
+          python scripts/secret_scan.py
+          go test ./...
+          go vet ./...
+          python scripts/package_release.py --version "$RELEASE_TAG"
+          python scripts/verify_release.py dist
+          tar -xzf "dist/pansou-${RELEASE_TAG}-linux-amd64.tar.gz" -C dist
+          python scripts/smoke_release.py "dist/pansou-${RELEASE_TAG}-linux-amd64/bin/pansou"
+      - name: Upload release assets
+        run: gh release upload "$RELEASE_TAG" dist/*.tar.gz dist/PROVENANCE.json dist/SHA256SUMS
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish only the fixed version tag
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/tumblr-code/pansou:${{ env.RELEASE_TAG }}
+          build-args: |
+            VERSION=${{ env.RELEASE_TAG }}
+            VCS_REF=${{ github.sha }}

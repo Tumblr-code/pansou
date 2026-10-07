@@ -3,10 +3,10 @@ package hdmoli
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
-	"pansou/util"
 	"regexp"
 	"strings"
 	"sync"
@@ -21,7 +21,7 @@ const (
 	PluginName     = "hdmoli"
 	DisplayName    = "HDmoli"
 	Description    = "HDmoli - 影视资源网盘下载链接搜索"
-	BaseURL        = "https://www.hdmoli.com"
+	BaseURL        = "https://www.hdmoli.pro"
 	SearchPath     = "/search.php?searchkey=%s&submit="
 	UserAgent      = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
 	MaxResults     = 50
@@ -99,7 +99,7 @@ func (p *HdmoliPlugin) searchImpl(client *http.Client, keyword string, ext map[s
 
 	// 第三步：关键词过滤（标准网盘插件需要过滤）
 	filteredResults := plugin.FilterResultsByKeyword(finalResults, keyword)
-
+	
 	if p.debugMode {
 		log.Printf("[HDMOLI] 关键词过滤后剩余 %d 个结果", len(filteredResults))
 	}
@@ -153,35 +153,28 @@ func (p *HdmoliPlugin) executeSearch(client *http.Client, keyword string) ([]mod
 func (p *HdmoliPlugin) doRequestWithRetry(req *http.Request, client *http.Client) (*http.Response, error) {
 	maxRetries := 3
 	var lastErr error
-
+	
 	for i := 0; i < maxRetries; i++ {
 		if i > 0 {
 			// 指数退避重试
 			backoff := time.Duration(1<<uint(i-1)) * 200 * time.Millisecond
 			time.Sleep(backoff)
 		}
-
+		
 		// 克隆请求避免并发问题
 		reqClone := req.Clone(req.Context())
-
+		
 		resp, err := client.Do(reqClone)
 		if err == nil && resp.StatusCode == 200 {
 			return resp, nil
 		}
-
+		
 		if resp != nil {
-			status := resp.StatusCode
 			resp.Body.Close()
-			if err == nil {
-				// Do 成功但状态码非 200。此前这里只执行 lastErr = err，
-				// err 为 nil 时会把 lastErr 清空，三次失败后仅报出
-				// "%!w(<nil>)"，真实状态码被丢掉、无法定位失败原因。
-				err = fmt.Errorf("HTTP 状态码 %d", status)
-			}
 		}
 		lastErr = err
 	}
-
+	
 	return nil, fmt.Errorf("[%s] 重试 %d 次后仍然失败: %w", p.Name(), maxRetries, lastErr)
 }
 
@@ -311,18 +304,13 @@ func (p *HdmoliPlugin) parseResultItem(s *goquery.Selection, index int) *model.S
 	}
 
 	// 构建初始结果对象（详情页链接稍后获取）
-	itemID := detailURL
-	if parsedURL, err := url.Parse(detailURL); err == nil {
-		itemID = parsedURL.Path
-	}
-	stableID := fmt.Sprintf("%s-%s", p.Name(), url.QueryEscape(strings.Trim(itemID, "/")))
 	result := model.SearchResult{
 		Title:     title,
 		Content:   content,
 		Channel:   "", // 插件搜索结果必须为空字符串（按开发指南要求）
-		MessageID: stableID,
-		UniqueID:  stableID,
-		Datetime:  time.Now(),     // 搜索结果页没有明确时间，使用当前时间
+		MessageID: fmt.Sprintf("%s-%d-%d", p.Name(), index, time.Now().Unix()),
+		UniqueID:  fmt.Sprintf("%s-%d-%d", p.Name(), index, time.Now().Unix()),
+		Datetime:  time.Now(), // 搜索结果页没有明确时间，使用当前时间
 		Links:     []model.Link{}, // 先为空，详情页处理后添加
 		Tags:      tags,
 	}
@@ -407,19 +395,19 @@ func (p *HdmoliPlugin) extractCategoryInfo(s *goquery.Selection) (category, regi
 					// 提取分类，可能包含地区和年份信息
 					info := strings.TrimSpace(parts[i+1])
 					// 按分隔符分割
-					infoParts := hdmoliRe1.Split(info, -1)
+					infoParts := regexp.MustCompile(`[，,\s]+`).Split(info, -1)
 					if len(infoParts) > 0 && infoParts[0] != "" {
 						category = infoParts[0]
 					}
 				} else if strings.HasSuffix(parts[i], "地区") && i+1 < len(parts) {
 					regionPart := strings.TrimSpace(parts[i+1])
-					regionParts := hdmoliRe1.Split(regionPart, -1)
+					regionParts := regexp.MustCompile(`[，,\s]+`).Split(regionPart, -1)
 					if len(regionParts) > 0 && regionParts[0] != "" {
 						region = regionParts[0]
 					}
 				} else if strings.HasSuffix(parts[i], "年份") && i+1 < len(parts) {
 					yearPart := strings.TrimSpace(parts[i+1])
-					yearParts := hdmoliRe1.Split(yearPart, -1)
+					yearParts := regexp.MustCompile(`[，,\s]+`).Split(yearPart, -1)
 					if len(yearParts) > 0 && yearParts[0] != "" {
 						year = yearParts[0]
 					}
@@ -469,7 +457,7 @@ func (p *HdmoliPlugin) fetchDetailLinks(client *http.Client, searchResults []mod
 		wg.Add(1)
 		go func(r model.SearchResult) {
 			defer wg.Done()
-			semaphore <- struct{}{}        // 获取信号量
+			semaphore <- struct{}{} // 获取信号量
 			defer func() { <-semaphore }() // 释放信号量
 
 			// 从Content中提取详情页URL
@@ -579,7 +567,7 @@ func (p *HdmoliPlugin) fetchDetailPageLinks(client *http.Client, detailURL strin
 	}
 
 	// 读取响应体
-	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		if p.debugMode {
 			log.Printf("[HDMOLI] 读取详情页响应失败: %v", err)
@@ -620,7 +608,7 @@ func (p *HdmoliPlugin) parseNetworkDiskLinks(htmlContent string) []model.Link {
 	doc.Find(".downlist").Each(func(i int, s *goquery.Selection) {
 		s.Find("p").Each(func(j int, pEl *goquery.Selection) {
 			text := pEl.Text()
-
+			
 			// 查找夸克网盘
 			if strings.Contains(text, "夸 克：") || strings.Contains(text, "夸克：") {
 				pEl.Find("a").Each(func(k int, a *goquery.Selection) {
@@ -638,7 +626,7 @@ func (p *HdmoliPlugin) parseNetworkDiskLinks(htmlContent string) []model.Link {
 					}
 				})
 			}
-
+			
 			// 查找百度网盘
 			if strings.Contains(text, "百 度：") || strings.Contains(text, "百度：") {
 				pEl.Find("a").Each(func(k int, a *goquery.Selection) {
@@ -668,7 +656,7 @@ func (p *HdmoliPlugin) parseNetworkDiskLinksWithRegex(htmlContent string) []mode
 	var links []model.Link
 
 	// 夸克网盘链接模式
-	quarkPattern := hdmoliRe2
+	quarkPattern := regexp.MustCompile(`<b>夸\s*克：</b><a[^>]*href\s*=\s*["']([^"']*pan\.quark\.cn[^"']*)["'][^>]*>`)
 	quarkMatches := quarkPattern.FindAllStringSubmatch(htmlContent, -1)
 	for _, match := range quarkMatches {
 		if len(match) > 1 {
@@ -682,7 +670,7 @@ func (p *HdmoliPlugin) parseNetworkDiskLinksWithRegex(htmlContent string) []mode
 	}
 
 	// 百度网盘链接模式
-	baiduPattern := hdmoliRe3
+	baiduPattern := regexp.MustCompile(`<b>百\s*度：</b><a[^>]*href\s*=\s*["']([^"']*pan\.baidu\.com[^"']*)["'][^>]*>`)
 	baiduMatches := baiduPattern.FindAllStringSubmatch(htmlContent, -1)
 	for _, match := range baiduMatches {
 		if len(match) > 1 {
@@ -722,11 +710,3 @@ func (p *HdmoliPlugin) extractPasswordFromBaiduURL(panURL string) string {
 	}
 	return ""
 }
-
-// 以下正则原先在函数内临时编译，每次调用都要重新解析模式；
-// 提到包级后只编译一次，匹配行为不变。
-var (
-	hdmoliRe1 = regexp.MustCompile(`[，,\s]+`)
-	hdmoliRe2 = regexp.MustCompile(`<b>夸\s*克：</b><a[^>]*href\s*=\s*["']([^"']*pan\.quark\.cn[^"']*)["'][^>]*>`)
-	hdmoliRe3 = regexp.MustCompile(`<b>百\s*度：</b><a[^>]*href\s*=\s*["']([^"']*pan\.baidu\.com[^"']*)["'][^>]*>`)
-)

@@ -7,7 +7,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"pansou/util"
 	"regexp"
 	"strings"
 	"sync"
@@ -226,7 +225,7 @@ func (p *Xb6vPlugin) searchImpl(client *http.Client, keyword string, ext map[str
 		// 可能是JavaScript重定向或meta refresh
 		if strings.Contains(bodyStr, "location.href") || strings.Contains(bodyStr, "window.location") {
 			// JavaScript重定向
-			re := xb6vRe1
+			re := regexp.MustCompile(`location\.href\s*=\s*["']([^"']+)["']`)
 			matches := re.FindStringSubmatch(bodyStr)
 			if len(matches) > 1 {
 				location = matches[1]
@@ -239,7 +238,7 @@ func (p *Xb6vPlugin) searchImpl(client *http.Client, keyword string, ext map[str
 		// 尝试查找其他形式的重定向
 		if location == "" {
 			// 查找可能的URL模式，比如包含searchid的链接
-			re := xb6vRe2
+			re := regexp.MustCompile(`(?:href|url)\s*[=:]\s*["']?([^"'\s]*searchid=[^"'\s&]+)`)
 			matches := re.FindAllStringSubmatch(bodyStr, -1)
 			for _, match := range matches {
 				if len(match) > 1 {
@@ -254,7 +253,7 @@ func (p *Xb6vPlugin) searchImpl(client *http.Client, keyword string, ext map[str
 
 		// 如果还是没找到，尝试查找简单的result/?searchid=格式
 		if location == "" {
-			re := xb6vRe3
+			re := regexp.MustCompile(`result/\?searchid=\d+`)
 			match := re.FindString(bodyStr)
 			if match != "" {
 				location = match
@@ -356,7 +355,7 @@ func (p *Xb6vPlugin) getResponseReader(resp *http.Response) (io.Reader, error) {
 		if err != nil {
 			return nil, fmt.Errorf("创建gzip reader失败: %w", err)
 		}
-		reader = util.NewCappedReader(gzReader, util.MaxDecompressedBytes)
+		reader = gzReader
 	}
 
 	return reader, nil
@@ -484,7 +483,7 @@ func (p *Xb6vPlugin) isValidContentURL(href string) bool {
 	}
 
 	// 检查是否包含数字（内容ID）
-	hasNumber := xb6vRe4.MatchString(nameWithoutExt)
+	hasNumber := regexp.MustCompile(`\d+`).MatchString(nameWithoutExt)
 	return hasNumber
 }
 
@@ -530,7 +529,7 @@ func (p *Xb6vPlugin) cleanTitle(title string) string {
 	// 清理多余的空格和特殊字符
 	cleaned = strings.TrimSpace(cleaned)
 	// 移除多个连续空格
-	re := xb6vRe5
+	re := regexp.MustCompile(`\s+`)
 	cleaned = re.ReplaceAllString(cleaned, " ")
 
 	if cleaned == "" {
@@ -774,7 +773,7 @@ func (p *Xb6vPlugin) extractMagnetLinks(doc *goquery.Document, mainTitle string)
 // extractResourceID 从详情页URL提取资源ID
 func (p *Xb6vPlugin) extractResourceID(detailURL string) string {
 	// 从URL中提取ID，如：/dianshiju/guoju/26608.html -> 26608
-	re := xb6vRe6
+	re := regexp.MustCompile(`/(\d+)\.html`)
 	matches := re.FindStringSubmatch(detailURL)
 	if len(matches) > 1 {
 		return matches[1]
@@ -802,14 +801,3 @@ func (p *Xb6vPlugin) filterValidResults(results []model.SearchResult) []model.Se
 func init() {
 	plugin.RegisterGlobalPlugin(NewXb6vPlugin())
 }
-
-// 以下正则原先在函数内临时编译，每次调用都要重新解析模式；
-// 提到包级后只编译一次，匹配行为不变。
-var (
-	xb6vRe1 = regexp.MustCompile(`location\.href\s*=\s*["']([^"']+)["']`)
-	xb6vRe2 = regexp.MustCompile(`(?:href|url)\s*[=:]\s*["']?([^"'\s]*searchid=[^"'\s&]+)`)
-	xb6vRe3 = regexp.MustCompile(`result/\?searchid=\d+`)
-	xb6vRe4 = regexp.MustCompile(`\d+`)
-	xb6vRe5 = regexp.MustCompile(`\s+`)
-	xb6vRe6 = regexp.MustCompile(`/(\d+)\.html`)
-)

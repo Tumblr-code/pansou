@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -21,90 +22,36 @@ import (
 	"pansou/service"
 	"pansou/util"
 	"pansou/util/cache"
-	"pansou/util/cpu"
-	"pansou/util/memlimit"
 
 	// 以下是插件的空导入，用于触发各插件的init函数，实现自动注册
 	// 添加新插件时，只需在此处添加对应的导入语句即可
-	_ "pansou/plugin/5266ys"
-	_ "pansou/plugin/aipan"
-	_ "pansou/plugin/btbtlb"
-	_ "pansou/plugin/buerchen"
-	_ "pansou/plugin/cldi"
-	_ "pansou/plugin/clmao"
-	_ "pansou/plugin/clxiong"
-	_ "pansou/plugin/cyg"
-	_ "pansou/plugin/diduan"
-	_ "pansou/plugin/djgou"
-	_ "pansou/plugin/duanjuw"
-	_ "pansou/plugin/duoduo"
-	_ "pansou/plugin/dy4k"
-	_ "pansou/plugin/dygang"
-	_ "pansou/plugin/dyyj"
 	_ "pansou/plugin/dyyjpro"
-
-	// _ "pansou/plugin/erxiao"
-	_ "pansou/plugin/erxiaopan"
+	_ "pansou/plugin/duoduo"
 	_ "pansou/plugin/feikuai"
 	_ "pansou/plugin/gaoqing888"
 	_ "pansou/plugin/gying"
-	_ "pansou/plugin/haitunsou"
-	_ "pansou/plugin/hdmoli"
-	_ "pansou/plugin/hjzhencai"
-	_ "pansou/plugin/huban"
 	_ "pansou/plugin/hunhepan"
 	_ "pansou/plugin/ikantv"
-	_ "pansou/plugin/jsnoteclub"
-
-	//_ "pansou/plugin/jupansou"
 	_ "pansou/plugin/jutoushe"
 	_ "pansou/plugin/kkv"
-	_ "pansou/plugin/kpkuang"
-	_ "pansou/plugin/labi"
-	_ "pansou/plugin/leso"
-	_ "pansou/plugin/libvio"
 	_ "pansou/plugin/lingjisp"
 	_ "pansou/plugin/lou1"
-	_ "pansou/plugin/meitizy"
 	_ "pansou/plugin/melost"
-	_ "pansou/plugin/miosou"
-	_ "pansou/plugin/muou"
-	_ "pansou/plugin/nsgame"
 	_ "pansou/plugin/nyaa"
 	_ "pansou/plugin/ouge"
-	_ "pansou/plugin/pan365"
 	_ "pansou/plugin/panlian"
-	_ "pansou/plugin/pansearch"
-	_ "pansou/plugin/qiwei"
 	_ "pansou/plugin/qqpd"
 	_ "pansou/plugin/quark4k"
-	_ "pansou/plugin/quarkres"
 	_ "pansou/plugin/quarksoo"
 	_ "pansou/plugin/quarktv"
-
-	// _ "pansou/plugin/qupanshe"
-	_ "pansou/plugin/rrbt"
-	_ "pansou/plugin/shandian"
-	_ "pansou/plugin/sopanya"
+	_ "pansou/plugin/qupanshe"
 	_ "pansou/plugin/sousou"
-	_ "pansou/plugin/susu"
 	_ "pansou/plugin/thepiratebay"
-	_ "pansou/plugin/ting77"
-	_ "pansou/plugin/u3c3"
 	_ "pansou/plugin/wanou"
 	_ "pansou/plugin/weibo"
-	_ "pansou/plugin/woniu"
 	_ "pansou/plugin/xb6v"
-	_ "pansou/plugin/xdpan"
-	_ "pansou/plugin/xiaokupan"
-	_ "pansou/plugin/xiaoyu"
 	_ "pansou/plugin/xiaozhang"
-	_ "pansou/plugin/yingso"
-	_ "pansou/plugin/yulinshufa"
 	_ "pansou/plugin/yunso"
-	_ "pansou/plugin/yunsou"
-	_ "pansou/plugin/zhizhen"
-	_ "pansou/plugin/zlxapp"
 	_ "pansou/plugin/zxzj"
 )
 
@@ -112,15 +59,6 @@ import (
 var globalCacheWriteManager *cache.DelayedBatchWriteManager
 
 func main() {
-	// 容器内存配额可见：按 cgroup 配额设置 Go 堆软上限（automemlimit 的做法，取配额的 9/10，
-	// 留 10% 给 goroutine 栈、运行时结构和堆外内存）。必须在做任何重分配之前执行。
-	// 容器外、配额无限、或部署方已显式设置 GOMEMLIMIT 时都是 no-op，理由打在日志里便于核对。
-	if limit, reason := memlimit.ApplyFromCgroup(); limit > 0 {
-		fmt.Printf("[启动] 堆软上限 GOMEMLIMIT=%dMB（%s）\n", limit/(1<<20), reason)
-	} else {
-		fmt.Printf("[启动] 未设置堆软上限：%s\n", reason)
-	}
-
 	// 初始化应用
 	initApp()
 
@@ -161,10 +99,6 @@ func initApp() {
 
 	// 确保异步插件系统初始化
 	plugin.InitAsyncPluginSystem()
-
-	// 后台常驻探测 t.me 可达性：被墙时 TG 阶段直接跳过，省掉 111 个必然挂满超时的频道请求。
-	// 探测在后台跑，搜索路径只读结论，不引入额外时延。
-	service.StartTGReachabilityProbe()
 }
 
 // startServer 启动Web服务器
@@ -283,15 +217,15 @@ func printServiceInfo(port string, pluginManager *plugin.PluginManager) {
 		} else if strings.HasPrefix(config.AppConfig.ProxyURL, "https://") {
 			proxyType = "HTTPS代理"
 		}
-		fmt.Printf("使用%s (PROXY): %s\n", proxyType, util.MaskProxyURL(config.AppConfig.ProxyURL))
+		fmt.Printf("使用%s (PROXY): %s\n", proxyType, config.AppConfig.ProxyURL)
 		hasProxy = true
 	}
 	if config.AppConfig.HTTPProxyURL != "" {
-		fmt.Printf("使用HTTP代理 (HTTP_PROXY/http_proxy): %s\n", util.MaskProxyURL(config.AppConfig.HTTPProxyURL))
+		fmt.Printf("使用HTTP代理 (HTTP_PROXY/http_proxy): %s\n", config.AppConfig.HTTPProxyURL)
 		hasProxy = true
 	}
 	if config.AppConfig.HTTPSProxyURL != "" {
-		fmt.Printf("使用HTTPS代理 (HTTPS_PROXY/https_proxy): %s\n", util.MaskProxyURL(config.AppConfig.HTTPSProxyURL))
+		fmt.Printf("使用HTTPS代理 (HTTPS_PROXY/https_proxy): %s\n", config.AppConfig.HTTPSProxyURL)
 		hasProxy = true
 	}
 	if !hasProxy {
@@ -352,8 +286,8 @@ func printServiceInfo(port string, pluginManager *plugin.PluginManager) {
 	if os.Getenv("HTTP_MAX_CONNS") != "" {
 		maxConnsMsg = "(由环境变量指定)"
 	} else {
-		cpuCount := cpu.SchedulableCount()
-		maxConnsMsg = fmt.Sprintf("(自动计算: GOMAXPROCS=%d × 200)", cpuCount)
+		cpuCount := runtime.NumCPU()
+		maxConnsMsg = fmt.Sprintf("(自动计算: CPU核心数%d × 200)", cpuCount)
 	}
 
 	fmt.Printf("HTTP服务器配置: 读取超时=%v %s, 写入超时=%v %s, 空闲超时=%v, 最大连接数=%d %s\n",
@@ -369,8 +303,8 @@ func printServiceInfo(port string, pluginManager *plugin.PluginManager) {
 		if os.Getenv("ASYNC_MAX_BACKGROUND_WORKERS") != "" {
 			workersMsg = "(由环境变量指定)"
 		} else {
-			cpuCount := cpu.SchedulableCount()
-			workersMsg = fmt.Sprintf("(自动计算: GOMAXPROCS=%d × 5)", cpuCount)
+			cpuCount := runtime.NumCPU()
+			workersMsg = fmt.Sprintf("(自动计算: CPU核心数%d × 5)", cpuCount)
 		}
 
 		// 检查任务数量是否由环境变量指定

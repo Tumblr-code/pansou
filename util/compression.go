@@ -3,8 +3,9 @@ package util
 import (
 	"bytes"
 	"compress/gzip"
+	"io/ioutil"
 	"strings"
-
+	
 	"github.com/gin-gonic/gin"
 	"pansou/config"
 )
@@ -38,34 +39,34 @@ func GzipMiddleware() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-
+		
 		// 检查客户端是否支持gzip
 		if !strings.Contains(c.Request.Header.Get("Accept-Encoding"), "gzip") {
 			c.Next()
 			return
 		}
-
+		
 		// 创建一个缓冲响应写入器
 		buffer := &bytes.Buffer{}
 		blw := &bodyLogWriter{body: buffer, ResponseWriter: c.Writer}
 		c.Writer = blw
-
+		
 		// 处理请求
 		c.Next()
-
+		
 		// 获取响应内容
 		responseData := buffer.Bytes()
-
+		
 		// 如果响应大小小于最小压缩大小，直接返回原始内容
 		if len(responseData) < config.AppConfig.MinSizeToCompress {
 			c.Writer.Write(responseData)
 			return
 		}
-
+		
 		// 设置gzip响应头
 		c.Header("Content-Encoding", "gzip")
 		c.Header("Vary", "Accept-Encoding")
-
+		
 		// 创建gzip写入器
 		gz, err := gzip.NewWriterLevel(c.Writer, gzip.BestSpeed)
 		if err != nil {
@@ -73,7 +74,7 @@ func GzipMiddleware() gin.HandlerFunc {
 			return
 		}
 		defer gz.Close()
-
+		
 		// 写入压缩内容
 		gz.Write(responseData)
 	}
@@ -100,23 +101,23 @@ func (w bodyLogWriter) WriteString(s string) (int, error) {
 // CompressData 压缩数据
 func CompressData(data []byte) ([]byte, error) {
 	var buf bytes.Buffer
-
+	
 	// 创建gzip写入器
 	gz, err := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
 	if err != nil {
 		return nil, err
 	}
-
+	
 	// 写入数据
 	if _, err := gz.Write(data); err != nil {
 		return nil, err
 	}
-
+	
 	// 关闭写入器
 	if err := gz.Close(); err != nil {
 		return nil, err
 	}
-
+	
 	return buf.Bytes(), nil
 }
 
@@ -128,11 +129,7 @@ func DecompressData(data []byte) ([]byte, error) {
 		return nil, err
 	}
 	defer gz.Close()
-
-	// 读取解压后的数据，并按绝对上限封顶。
-	//
-	// 这里只做绝对上限、不套压缩比：本函数解压的是**自写缓存**的数据（不是不可信上游），
-	// 而缓存里高度重复的 JSON 合法地超过 100:1——按比值拦会误伤真实数据。
-	// 压缩比那一层留给上游响应路径（见 ReadAllDecompressed 的调用点）。
-	return ReadAllLimited(NewCappedReader(gz, MaxDecompressedBytes), MaxDecompressedBytes)
-}
+	
+	// 读取解压后的数据
+	return ioutil.ReadAll(gz)
+} 

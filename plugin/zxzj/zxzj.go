@@ -3,6 +3,7 @@ package zxzj
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -13,7 +14,6 @@ import (
 	"github.com/PuerkitoBio/goquery"
 	"pansou/model"
 	"pansou/plugin"
-	"pansou/util"
 	"pansou/util/json"
 )
 
@@ -35,7 +35,6 @@ func init() {
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 			Transport: &http.Transport{
-				Proxy:               util.ProxyFuncForTransport(),
 				MaxIdleConns:        100,
 				MaxIdleConnsPerHost: 10,
 				IdleConnTimeout:     90 * time.Second,
@@ -126,7 +125,7 @@ func (p *ZXZJPlugin) fetchSearchResults(searchURL string) ([]searchItem, error) 
 			return
 		}
 
-		re := zxzjRe1
+		re := regexp.MustCompile(`/(voddetail|detail)/(\d+)\.html`)
 		matches := re.FindStringSubmatch(href)
 		if len(matches) < 3 {
 			return
@@ -349,7 +348,7 @@ func (p *ZXZJPlugin) fetchSinglePanLink(pl playLink) *model.Link {
 		return nil
 	}
 
-	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil
 	}
@@ -377,7 +376,7 @@ type playerData struct {
 }
 
 func (p *ZXZJPlugin) parsePlayerData(body []byte) (string, string) {
-	re := zxzjRe2
+	re := regexp.MustCompile(`var\s+player_aaaa\s*=\s*(\{[^;]+\})`)
 	matches := re.FindSubmatch(body)
 	if len(matches) < 2 {
 		return "", ""
@@ -421,7 +420,7 @@ func (p *ZXZJPlugin) extractPassword(panURL string) string {
 		}
 	}
 
-	pwdRegex := zxzjRe3
+	pwdRegex := regexp.MustCompile(`pwd=([a-zA-Z0-9]{4})`)
 	if matches := pwdRegex.FindStringSubmatch(panURL); len(matches) > 1 {
 		return matches[1]
 	}
@@ -474,7 +473,7 @@ func (p *ZXZJPlugin) setHeaders(req *http.Request, referer string) {
 }
 
 func (p *ZXZJPlugin) parseUpdateTime(text string) time.Time {
-	updateRegex := zxzjRe4
+	updateRegex := regexp.MustCompile(`更新[：:]\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}|\d{4}-\d{2}-\d{2})`)
 	matches := updateRegex.FindStringSubmatch(text)
 	if len(matches) < 2 {
 		return time.Time{}
@@ -513,26 +512,10 @@ func (p *ZXZJPlugin) doRequestWithRetry(req *http.Request, client *http.Client) 
 		}
 
 		if resp != nil {
-			status := resp.StatusCode
 			resp.Body.Close()
-			if err == nil {
-				// Do 成功但状态码非 200。此前这里只执行 lastErr = err，
-				// err 为 nil 时会把 lastErr 清空，三次失败后仅报出
-				// "%!w(<nil>)"，真实状态码被丢掉、无法定位失败原因。
-				err = fmt.Errorf("HTTP 状态码 %d", status)
-			}
 		}
 		lastErr = err
 	}
 
 	return nil, fmt.Errorf("重试 %d 次后仍然失败: %w", maxRetries, lastErr)
 }
-
-// 以下正则原先在函数内临时编译，每次调用都要重新解析模式；
-// 提到包级后只编译一次，匹配行为不变。
-var (
-	zxzjRe1 = regexp.MustCompile(`/(voddetail|detail)/(\d+)\.html`)
-	zxzjRe2 = regexp.MustCompile(`var\s+player_aaaa\s*=\s*(\{[^;]+\})`)
-	zxzjRe3 = regexp.MustCompile(`pwd=([a-zA-Z0-9]{4})`)
-	zxzjRe4 = regexp.MustCompile(`更新[：:]\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}|\d{4}-\d{2}-\d{2})`)
-)
